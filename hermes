@@ -7,5 +7,13 @@ subcommands such as `gateway`, `cron`, and `doctor`.
 """
 
 if __name__ == "__main__":
+    import os
+    from pathlib import Path
+
+    source = Path(__file__).resolve()
+    codex_bootstrap = source.parent / "scripts" / "run-hermes-codex.sh"
+    if codex_bootstrap.exists() and os.environ.get("HERMES_CODEX_BOOTSTRAPPED") != "1":
+        os.execv(str(codex_bootstrap), [str(codex_bootstrap), *os.sys.argv[1:]])
+
     from hermes_cli.main import main
     main()

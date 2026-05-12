@@ -99,22 +99,29 @@ class TestHandleVoiceCommand:
         event = _make_event("/voice on")
         result = await runner._handle_voice_command(event)
         assert "enabled" in result.lower()
-        assert runner._voice_mode["telegram:123"] == "voice_only"
+        assert runner._voice_mode["123"] == "voice_only"
 
     @pytest.mark.asyncio
     async def test_voice_off(self, runner):
-        runner._voice_mode["telegram:123"] = "voice_only"
+        runner._voice_mode["123"] = "voice_only"
         event = _make_event("/voice off")
         result = await runner._handle_voice_command(event)
         assert "disabled" in result.lower()
-        assert runner._voice_mode["telegram:123"] == "off"
+        assert runner._voice_mode["123"] == "off"
 
     @pytest.mark.asyncio
     async def test_voice_tts(self, runner):
         event = _make_event("/voice tts")
         result = await runner._handle_voice_command(event)
         assert "tts" in result.lower()
-        assert runner._voice_mode["telegram:123"] == "all"
+        assert runner._voice_mode["123"] == "all"
+
+    @pytest.mark.asyncio
+    async def test_voice_audio_only(self, runner):
+        event = _make_event("/voice audio")
+        result = await runner._handle_voice_command(event)
+        assert "audio-only" in result.lower()
+        assert runner._voice_mode["123"] == "audio_only"
 
     @pytest.mark.asyncio
     async def test_voice_status_off(self, runner):
@@ -124,7 +131,7 @@ class TestHandleVoiceCommand:
 
     @pytest.mark.asyncio
     async def test_voice_status_on(self, runner):
-        runner._voice_mode["telegram:123"] = "voice_only"
+        runner._voice_mode["123"] = "voice_only"
         event = _make_event("/voice status")
         result = await runner._handle_voice_command(event)
         assert "voice reply" in result.lower()
@@ -134,15 +141,15 @@ class TestHandleVoiceCommand:
         event = _make_event("/voice")
         result = await runner._handle_voice_command(event)
         assert "enabled" in result.lower()
-        assert runner._voice_mode["telegram:123"] == "voice_only"
+        assert runner._voice_mode["123"] == "voice_only"
 
     @pytest.mark.asyncio
     async def test_toggle_on_to_off(self, runner):
-        runner._voice_mode["telegram:123"] = "voice_only"
+        runner._voice_mode["123"] = "voice_only"
         event = _make_event("/voice")
         result = await runner._handle_voice_command(event)
         assert "disabled" in result.lower()
-        assert runner._voice_mode["telegram:123"] == "off"
+        assert runner._voice_mode["123"] == "off"
 
     @pytest.mark.asyncio
     async def test_persistence_saved(self, runner):
@@ -150,94 +157,39 @@ class TestHandleVoiceCommand:
         await runner._handle_voice_command(event)
         assert runner._VOICE_MODE_PATH.exists()
         data = json.loads(runner._VOICE_MODE_PATH.read_text())
-        assert data["telegram:123"] == "voice_only"
+        assert data["123"] == "voice_only"
 
     @pytest.mark.asyncio
     async def test_persistence_loaded(self, runner):
-        runner._VOICE_MODE_PATH.write_text(json.dumps({"telegram:456": "all"}))
+        runner._VOICE_MODE_PATH.write_text(json.dumps({"456": "all"}))
         loaded = runner._load_voice_modes()
-        assert loaded == {"telegram:456": "all"}
+        assert loaded == {"456": "all"}
 
     @pytest.mark.asyncio
     async def test_persistence_saved_for_off(self, runner):
         event = _make_event("/voice off")
         await runner._handle_voice_command(event)
         data = json.loads(runner._VOICE_MODE_PATH.read_text())
-        assert data["telegram:123"] == "off"
+        assert data["123"] == "off"
 
     def test_sync_voice_mode_state_to_adapter_restores_off_chats(self, runner):
-        from gateway.config import Platform
-        runner._voice_mode = {"telegram:123": "off", "telegram:456": "all"}
-        adapter = SimpleNamespace(
-            _auto_tts_disabled_chats=set(),
-            platform=Platform.TELEGRAM,
-        )
+        runner._voice_mode = {"123": "off", "456": "all"}
+        adapter = SimpleNamespace(_auto_tts_disabled_chats=set())
 
         runner._sync_voice_mode_state_to_adapter(adapter)
 
         assert adapter._auto_tts_disabled_chats == {"123"}
 
-    def test_sync_populates_enabled_chats_from_voice_modes(self, runner):
-        """Issue #16007: sync also restores per-chat /voice on|tts opt-ins.
-
-        The adapter's ``_auto_tts_enabled_chats`` must mirror chats whose
-        persisted voice_mode is ``voice_only`` or ``all`` — without this,
-        ``/voice on`` was relying on a "not in disabled set" default that
-        silently enabled auto-TTS for every chat.
-        """
-        from gateway.config import Platform
-        runner._voice_mode = {
-            "telegram:off_chat": "off",
-            "telegram:on_chat": "voice_only",
-            "telegram:tts_chat": "all",
-            "slack:999": "voice_only",  # wrong platform, must be ignored
-        }
-        adapter = SimpleNamespace(
-            _auto_tts_default=False,
-            _auto_tts_disabled_chats=set(),
-            _auto_tts_enabled_chats=set(),
-            platform=Platform.TELEGRAM,
-        )
-
-        runner._sync_voice_mode_state_to_adapter(adapter)
-
-        assert adapter._auto_tts_disabled_chats == {"off_chat"}
-        assert adapter._auto_tts_enabled_chats == {"on_chat", "tts_chat"}
-
-    def test_sync_pushes_config_default_onto_adapter(self, runner, monkeypatch):
-        """Issue #16007: ``voice.auto_tts`` must propagate to ``_auto_tts_default``."""
-        from gateway.config import Platform
-
-        fake_cfg = {"voice": {"auto_tts": True}}
-        monkeypatch.setattr(
-            "hermes_cli.config.load_config",
-            lambda: fake_cfg,
-        )
-        adapter = SimpleNamespace(
-            _auto_tts_default=False,
-            _auto_tts_disabled_chats=set(),
-            _auto_tts_enabled_chats=set(),
-            platform=Platform.TELEGRAM,
-        )
-
-        runner._sync_voice_mode_state_to_adapter(adapter)
-
-        assert adapter._auto_tts_default is True
-
     def test_restart_restores_voice_off_state(self, runner, tmp_path):
-        from gateway.config import Platform
-        runner._VOICE_MODE_PATH.write_text(json.dumps({"telegram:123": "off"}))
+        runner._VOICE_MODE_PATH.write_text(json.dumps({"123": "off"}))
 
         restored_runner = _make_runner(tmp_path)
         restored_runner._voice_mode = restored_runner._load_voice_modes()
-        adapter = SimpleNamespace(
-            _auto_tts_disabled_chats=set(),
-            platform=Platform.TELEGRAM,
-        )
+        adapter = SimpleNamespace(_auto_tts_disabled_chats=set())
 
         restored_runner._sync_voice_mode_state_to_adapter(adapter)
 
-        assert restored_runner._voice_mode["telegram:123"] == "off"
+        assert restored_runner._voice_mode["123"] == "off"
         assert adapter._auto_tts_disabled_chats == {"123"}
 
     @pytest.mark.asyncio
@@ -246,21 +198,8 @@ class TestHandleVoiceCommand:
         e2 = _make_event("/voice tts", chat_id="bbb")
         await runner._handle_voice_command(e1)
         await runner._handle_voice_command(e2)
-        assert runner._voice_mode["telegram:aaa"] == "voice_only"
-        assert runner._voice_mode["telegram:bbb"] == "all"
-
-    @pytest.mark.asyncio
-    async def test_platform_isolation(self, runner):
-        """Same chat_id on different platforms must not collide (#12542)."""
-        telegram_event = _make_event("/voice on", chat_id="999")
-        slack_event = _make_event("/voice off", chat_id="999")
-        slack_event.source.platform.value = "slack"
-
-        await runner._handle_voice_command(telegram_event)
-        await runner._handle_voice_command(slack_event)
-
-        assert runner._voice_mode["telegram:999"] == "voice_only"
-        assert runner._voice_mode["slack:999"] == "off"
+        assert runner._voice_mode["aaa"] == "voice_only"
+        assert runner._voice_mode["bbb"] == "all"
 
 
 # =====================================================================
@@ -291,9 +230,9 @@ class TestAutoVoiceReply:
         """Call real _should_send_voice_reply on a GatewayRunner instance."""
         chat_id = "123"
         if voice_mode != "off":
-            runner._voice_mode["telegram:" + chat_id] = voice_mode
+            runner._voice_mode[chat_id] = voice_mode
         else:
-            runner._voice_mode.pop("telegram:" + chat_id, None)
+            runner._voice_mode.pop(chat_id, None)
 
         event = _make_event(message_type=message_type)
 
@@ -348,6 +287,25 @@ class TestAutoVoiceReply:
     def test_text_input_all_mode_runner_fires(self, runner):
         """all + text input: only runner fires (base auto-TTS only for voice)."""
         assert self._call(runner, "all", MessageType.TEXT) is True
+
+    def test_text_input_audio_only_runner_fires(self, runner):
+        """audio_only + text input: runner fires and caller may suppress text."""
+        assert self._call(runner, "audio_only", MessageType.TEXT) is True
+
+    def test_one_shot_voice_request_runner_fires_when_mode_off(self, runner):
+        """Explicit '发个语音' should trigger one-shot TTS even when mode is off."""
+        event = _make_event("发个语音", MessageType.TEXT)
+        assert runner._should_send_voice_reply(event, "Hello!", []) is True
+
+    def test_voice_config_question_does_not_trigger_one_shot(self, runner):
+        """Discussion about voice settings should not trigger TTS."""
+        event = _make_event("语音的音色你可以调整吗", MessageType.TEXT)
+        assert runner._should_send_voice_reply(event, "Hello!", []) is False
+
+    def test_policy_sentence_does_not_trigger_one_shot(self, runner):
+        """Rule-setting text mentioning 回复语音 must not trigger immediate TTS."""
+        event = _make_event("以后我让你回复语音你再回复语音 不然就文字", MessageType.TEXT)
+        assert runner._should_send_voice_reply(event, "Hello!", []) is False
 
     def test_text_input_voice_only_no_reply(self, runner):
         """voice_only + text input: neither fires."""
@@ -427,42 +385,12 @@ class TestSendVoiceReply:
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
-            await runner._send_voice_reply(event, "Hello world")
+            sent = await runner._send_voice_reply(event, "Hello world")
 
+        assert sent is True
         mock_adapter.send_voice.assert_called_once()
         call_args = mock_adapter.send_voice.call_args
         assert call_args.kwargs.get("chat_id") == "123"
-
-    @pytest.mark.asyncio
-    async def test_auto_voice_reply_uses_thread_metadata_helper(self, runner):
-        from gateway.config import Platform
-
-        mock_adapter = AsyncMock()
-        mock_adapter.send_voice = AsyncMock()
-        event = _make_event()
-        event.source.platform = Platform.TELEGRAM
-        event.source.chat_type = "dm"
-        event.source.thread_id = "20197"
-        event.message_id = "462"
-        runner.adapters[event.source.platform] = mock_adapter
-
-        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
-
-        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
-             patch("os.path.isfile", return_value=True), \
-             patch("os.unlink"), \
-             patch("os.makedirs"):
-            await runner._send_voice_reply(event, "Hello world")
-
-        mock_adapter.send_voice.assert_called_once()
-        call_kwargs = mock_adapter.send_voice.call_args.kwargs
-        assert call_kwargs["reply_to"] == "462"
-        assert call_kwargs["metadata"] == {
-            "thread_id": "20197",
-            "telegram_dm_topic_reply_fallback": True,
-            "telegram_reply_to_message_id": "462",
-        }
 
     @pytest.mark.asyncio
     async def test_empty_text_after_strip_skips(self, runner):
@@ -470,8 +398,9 @@ class TestSendVoiceReply:
 
         with patch("tools.tts_tool.text_to_speech_tool") as mock_tts, \
              patch("tools.tts_tool._strip_markdown_for_tts", return_value=""):
-            await runner._send_voice_reply(event, "```code only```")
+            sent = await runner._send_voice_reply(event, "```code only```")
 
+        assert sent is False
         mock_tts.assert_not_called()
 
     @pytest.mark.asyncio
@@ -485,8 +414,9 @@ class TestSendVoiceReply:
              patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=False), \
              patch("os.makedirs"):
-            await runner._send_voice_reply(event, "Hello")
+            sent = await runner._send_voice_reply(event, "Hello")
 
+        assert sent is False
         mock_adapter.send_voice.assert_not_called()
 
     @pytest.mark.asyncio
@@ -496,7 +426,9 @@ class TestSendVoiceReply:
              patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.makedirs"):
             # Should not raise
-            await runner._send_voice_reply(event, "Hello")
+            sent = await runner._send_voice_reply(event, "Hello")
+
+        assert sent is False
 
 
 # =====================================================================
@@ -515,7 +447,6 @@ class TestDiscordPlayTtsSkip:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
-        adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
@@ -812,7 +743,7 @@ class TestVoiceChannelCommands:
         result = await runner._handle_voice_channel_join(event)
         assert "joined" in result.lower()
         assert "General" in result
-        assert runner._voice_mode["discord:123"] == "all"
+        assert runner._voice_mode["123"] == "all"
         assert mock_adapter._voice_sources[111]["chat_id"] == "123"
         assert mock_adapter._voice_sources[111]["chat_type"] == "group"
 
@@ -858,7 +789,7 @@ class TestVoiceChannelCommands:
         result = await runner._handle_voice_channel_join(event)
 
         assert "voice dependencies are missing" in result.lower()
-        assert "PyNaCl" in result
+        assert "hermes-agent[messaging]" in result
 
     # -- _handle_voice_channel_leave --
 
@@ -890,10 +821,10 @@ class TestVoiceChannelCommands:
         mock_adapter.leave_voice_channel = AsyncMock()
         event = self._make_discord_event("/voice leave")
         runner.adapters[event.source.platform] = mock_adapter
-        runner._voice_mode["discord:123"] = "all"
+        runner._voice_mode["123"] = "all"
         result = await runner._handle_voice_channel_leave(event)
         assert "left" in result.lower()
-        assert runner._voice_mode["discord:123"] == "off"
+        assert runner._voice_mode["123"] == "off"
         mock_adapter.leave_voice_channel.assert_called_once_with(111)
 
     # -- _handle_voice_channel_input --
@@ -985,46 +916,6 @@ class TestVoiceChannelCommands:
         assert "Test transcript" in msg
         assert "42" in msg  # user_id in mention
 
-    @pytest.mark.asyncio
-    async def test_input_suppresses_duplicate_transcript(self, runner):
-        """Near-immediate duplicate STT output should not dispatch twice."""
-        from gateway.config import Platform
-
-        mock_adapter = AsyncMock()
-        mock_adapter._voice_text_channels = {111: 123}
-        mock_adapter._voice_sources = {}
-        mock_channel = AsyncMock()
-        mock_adapter._client = MagicMock()
-        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
-        mock_adapter.handle_message = AsyncMock()
-        runner.adapters[Platform.DISCORD] = mock_adapter
-
-        await runner._handle_voice_channel_input(111, 42, "Hello from VC")
-        await runner._handle_voice_channel_input(111, 42, "Hello from VC")
-
-        mock_adapter.handle_message.assert_called_once()
-        mock_channel.send.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_input_suppresses_near_duplicate_transcript(self, runner):
-        """Small STT wording drift should still be treated as the same utterance."""
-        from gateway.config import Platform
-
-        mock_adapter = AsyncMock()
-        mock_adapter._voice_text_channels = {111: 123}
-        mock_adapter._voice_sources = {}
-        mock_channel = AsyncMock()
-        mock_adapter._client = MagicMock()
-        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
-        mock_adapter.handle_message = AsyncMock()
-        runner.adapters[Platform.DISCORD] = mock_adapter
-
-        await runner._handle_voice_channel_input(111, 42, "This is a test of the voice system")
-        await runner._handle_voice_channel_input(111, 42, "This is a test for the voice system")
-
-        mock_adapter.handle_message.assert_called_once()
-        mock_channel.send.assert_called_once()
-
     # -- _get_guild_id --
 
     def test_get_guild_id_from_guild(self, runner):
@@ -1071,7 +962,6 @@ class TestDiscordVoiceChannelMethods:
         adapter.config = config
         adapter._client = MagicMock()
         adapter._voice_clients = {}
-        adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
@@ -1437,11 +1327,11 @@ class TestLeaveExceptionHandling:
         event = _make_event("/voice leave")
         event.raw_message = SimpleNamespace(guild_id=111, guild=None)
         runner.adapters[event.source.platform] = mock_adapter
-        runner._voice_mode["telegram:123"] = "all"
+        runner._voice_mode["123"] = "all"
 
         result = await runner._handle_voice_channel_leave(event)
         assert "left" in result.lower()
-        assert runner._voice_mode["telegram:123"] == "off"
+        assert runner._voice_mode["123"] == "off"
         assert mock_adapter._voice_input_callback is None
 
     @pytest.mark.asyncio
@@ -1455,7 +1345,7 @@ class TestLeaveExceptionHandling:
         event = _make_event("/voice leave")
         event.raw_message = SimpleNamespace(guild_id=111, guild=None)
         runner.adapters[event.source.platform] = mock_adapter
-        runner._voice_mode["telegram:123"] = "all"
+        runner._voice_mode["123"] = "all"
 
         await runner._handle_voice_channel_leave(event)
         assert mock_adapter._voice_input_callback is None
@@ -1853,7 +1743,6 @@ class TestVoiceTimeoutCleansRunnerState:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
-        adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
@@ -1902,11 +1791,11 @@ class TestVoiceTimeoutCleansRunnerState:
     async def test_runner_cleanup_method_removes_voice_mode(self, tmp_path):
         """_handle_voice_timeout_cleanup removes voice_mode for chat."""
         runner = _make_runner(tmp_path)
-        runner._voice_mode["discord:999"] = "all"
+        runner._voice_mode["999"] = "all"
 
         runner._handle_voice_timeout_cleanup("999")
 
-        assert runner._voice_mode["discord:999"] == "off", \
+        assert runner._voice_mode["999"] == "off", \
             "voice_mode must persist explicit off state after timeout cleanup"
 
     @pytest.mark.asyncio
@@ -1944,7 +1833,6 @@ class TestPlaybackTimeout:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
-        adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
@@ -2126,7 +2014,6 @@ class TestVoiceChannelAwareness:
         config.token = "fake-token"
         adapter = object.__new__(DiscordAdapter)
         adapter._voice_clients = {}
-        adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_receivers = {}
@@ -2597,7 +2484,6 @@ class TestVoiceTTSPlayback:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
-        adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_receivers = {}
@@ -2660,17 +2546,19 @@ class TestVoiceTTSPlayback:
         return runner
 
     def _call_should_reply(self, runner, voice_mode, msg_type, response="Hello",
-                           agent_msgs=None, already_sent=False):
+                           agent_msgs=None, already_sent=False, history_offset=0):
         from gateway.platforms.base import MessageType, MessageEvent, SessionSource
         from gateway.config import Platform
-        runner._voice_mode["discord:ch1"] = voice_mode
+        runner._voice_mode["ch1"] = voice_mode
         source = SessionSource(
             platform=Platform.DISCORD, chat_id="ch1",
             user_id="1", user_name="test", chat_type="channel",
         )
         event = MessageEvent(source=source, text="test", message_type=msg_type)
         return runner._should_send_voice_reply(
-            event, response, agent_msgs or [], already_sent=already_sent,
+            event, response, agent_msgs or [],
+            history_offset=history_offset,
+            already_sent=already_sent,
         )
 
     # -- Streaming OFF (existing behavior, must not change) --
@@ -2699,6 +2587,12 @@ class TestVoiceTTSPlayback:
         runner = self._make_runner()
         assert self._call_should_reply(runner, "voice_only", MessageType.TEXT) is False
 
+    def test_text_input_audio_only_tts(self):
+        """Streaming OFF + text input + voice_mode=audio_only: runner generates TTS."""
+        from gateway.platforms.base import MessageType
+        runner = self._make_runner()
+        assert self._call_should_reply(runner, "audio_only", MessageType.TEXT, already_sent=False) is True
+
     def test_error_response_no_tts(self):
         """Error response: no TTS regardless of voice_mode."""
         from gateway.platforms.base import MessageType
@@ -2719,6 +2613,27 @@ class TestVoiceTTSPlayback:
             {"id": "1", "type": "function", "function": {"name": "text_to_speech", "arguments": "{}"}}
         ]}]
         assert self._call_should_reply(runner, "all", MessageType.TEXT, agent_msgs=agent_msgs) is False
+
+    def test_history_tts_tool_does_not_block_current_turn_voice_reply(self):
+        """Old TTS calls in history must not disable voice_mode=all forever."""
+        from gateway.platforms.base import MessageType
+        runner = self._make_runner()
+        agent_msgs = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "text_to_speech", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "1", "content": '{"success": true}'},
+            {"role": "assistant", "content": "旧语音已发"},
+            {"role": "user", "content": "新的一轮"},
+            {"role": "assistant", "content": "现在该重新自动发语音"},
+        ]
+        assert self._call_should_reply(
+            runner,
+            "all",
+            MessageType.TEXT,
+            agent_msgs=agent_msgs,
+            history_offset=3,
+        ) is True
 
     # -- Streaming ON (already_sent=True) --
 
@@ -2778,7 +2693,6 @@ class TestUDPKeepalive:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
-        adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_receivers = {}
@@ -2824,56 +2738,3 @@ class TestUDPKeepalive:
             mock_conn.send_packet.assert_called_with(b'\xf8\xff\xfe')
         finally:
             DiscordAdapter._KEEPALIVE_INTERVAL = original_interval
-
-
-# =====================================================================
-# BasePlatformAdapter._should_auto_tts_for_chat — gate for auto-TTS
-# on voice input. Regression test for Issue #16007.
-# =====================================================================
-
-class TestShouldAutoTtsForChat:
-    """Three-layer gate: per-chat enable > per-chat disable > config default."""
-
-    def _make_adapter(self, *, default: bool, enabled=(), disabled=()):
-        """Build a bare adapter with only the attrs the gate reads."""
-        adapter = SimpleNamespace(
-            _auto_tts_default=default,
-            _auto_tts_enabled_chats=set(enabled),
-            _auto_tts_disabled_chats=set(disabled),
-        )
-        # Bind the unbound method — _should_auto_tts_for_chat only reads the
-        # three attrs above via ``self.``, so an unbound call works.
-        from gateway.platforms.base import BasePlatformAdapter
-        return BasePlatformAdapter._should_auto_tts_for_chat, adapter
-
-    def test_default_false_no_override_suppresses(self):
-        """Issue #16007: voice.auto_tts=False and no per-chat state → no TTS."""
-        fn, adapter = self._make_adapter(default=False)
-        assert fn(adapter, "chat1") is False
-
-    def test_default_true_no_override_fires(self):
-        fn, adapter = self._make_adapter(default=True)
-        assert fn(adapter, "chat1") is True
-
-    def test_explicit_enable_overrides_false_default(self):
-        """``/voice on`` with config auto_tts=False still fires."""
-        fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
-        assert fn(adapter, "chat1") is True
-
-    def test_explicit_disable_overrides_true_default(self):
-        """``/voice off`` with config auto_tts=True still suppresses."""
-        fn, adapter = self._make_adapter(default=True, disabled={"chat1"})
-        assert fn(adapter, "chat1") is False
-
-    def test_enabled_wins_over_disabled(self):
-        """An explicit enable beats an explicit disable (enable takes priority)."""
-        fn, adapter = self._make_adapter(
-            default=False, enabled={"chat1"}, disabled={"chat1"}
-        )
-        assert fn(adapter, "chat1") is True
-
-    def test_per_chat_isolation(self):
-        """Enable for chat1 doesn't leak to chat2."""
-        fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
-        assert fn(adapter, "chat1") is True
-        assert fn(adapter, "chat2") is False

@@ -1,0 +1,27 @@
+env:
+  enabled_toolsets: ["terminal", "file"]
+  max_agent_turns: 25
+  max_token_length: 32000
+  agent_temperature: 0.8
+  terminal_backend: "docker"
+  terminal_timeout: 300
+  tool_pool_size: 16
+  dataset_name: "NousResearch/openthoughts-tblite"
+  test_timeout: 600
+  task_timeout: 900
+  eval_concurrency: 1
+  max_concurrent_tasks: 1
+  tokenizer_name: "/Volumes/SPEED/Models/Olmx/models/olmx-qwen3.6-35b-a3b-4bit"
+  use_wandb: false
+  wandb_name: "openthoughts-tblite-local-qwen-no-thinking"
+  ensure_scores_are_not_same: false
+  data_dir_to_save_evals: "environments/benchmarks/evals/openthoughts-tblite-local-qwen-no-thinking"
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
+openai:
+  base_url: "http://127.0.0.1:18000/v1"
+  model_name: "olmx-qwen3.6-35b-a3b-4bit"
+  server_type: "openai"
+  health_check: false

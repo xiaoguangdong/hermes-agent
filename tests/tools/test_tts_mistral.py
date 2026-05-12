@@ -162,34 +162,27 @@ class TestGenerateMistralTts:
 
 
 class TestTtsDispatcherMistral:
-    def test_dispatcher_returns_disabled_error(
+    def test_dispatcher_routes_to_mistral(
         self, tmp_path, mock_mistral_module, monkeypatch
     ):
-        """Mistral TTS is intentionally disabled (PyPI quarantine 2026-05-12).
-
-        The dispatcher must short-circuit with a clear status message before
-        attempting any SDK import, even when MISTRAL_API_KEY is set and a
-        mock SDK is wired in. Restore routing once `mistralai` is
-        un-quarantined on PyPI.
-        """
         import json
 
         from tools.tts_tool import text_to_speech_tool
 
         monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        mock_mistral_module.audio.speech.complete.return_value = MagicMock(
+            audio_data=base64.b64encode(b"audio").decode()
+        )
 
         output_path = str(tmp_path / "out.mp3")
         with patch("tools.tts_tool._load_tts_config", return_value={"provider": "mistral"}):
             result = json.loads(text_to_speech_tool("Hello", output_path=output_path))
 
-        assert result["success"] is False
-        assert "temporarily disabled" in result["error"]
-        assert "quarantined" in result["error"]
-        # SDK must not have been called.
-        mock_mistral_module.audio.speech.complete.assert_not_called()
+        assert result["success"] is True
+        assert result["provider"] == "mistral"
+        mock_mistral_module.audio.speech.complete.assert_called_once()
 
     def test_dispatcher_returns_error_when_sdk_not_installed(self, tmp_path, monkeypatch):
-        """Same disabled message regardless of SDK presence."""
         import json
 
         from tools.tts_tool import text_to_speech_tool
@@ -203,7 +196,7 @@ class TestTtsDispatcherMistral:
             )
 
         assert result["success"] is False
-        assert "temporarily disabled" in result["error"]
+        assert "mistralai" in result["error"]
 
 
 class TestCheckTtsRequirementsMistral:
@@ -223,8 +216,63 @@ class TestCheckTtsRequirementsMistral:
         with patch("tools.tts_tool._import_edge_tts", side_effect=ImportError), \
              patch("tools.tts_tool._import_elevenlabs", side_effect=ImportError), \
              patch("tools.tts_tool._import_openai_client", side_effect=ImportError), \
-             patch("tools.tts_tool._check_neutts_available", return_value=False), \
-             patch("tools.tts_tool._check_kittentts_available", return_value=False), \
-             patch("tools.tts_tool._check_piper_available", return_value=False), \
-             patch("tools.tts_tool._has_any_command_tts_provider", return_value=False):
+             patch("tools.tts_tool._check_neutts_available", return_value=False):
             assert check_tts_requirements() is False
+
+
+class TestMistralTtsOpus:
+    def test_telegram_produces_ogg_and_voice_compatible(
+        self, tmp_path, mock_mistral_module, monkeypatch
+    ):
+        import json
+
+        from tools.tts_tool import text_to_speech_tool
+
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+        mock_mistral_module.audio.speech.complete.return_value = MagicMock(
+            audio_data=base64.b64encode(b"opus-audio").decode()
+        )
+
+        with patch("tools.tts_tool._load_tts_config", return_value={"provider": "mistral"}):
+            result = json.loads(text_to_speech_tool("Hello"))
+
+        assert result["success"] is True
+        assert result["file_path"].endswith(".ogg")
+        assert result["voice_compatible"] is True
+        assert "[[audio_as_voice]]" in result["media_tag"]
+        call_kwargs = mock_mistral_module.audio.speech.complete.call_args[1]
+        assert call_kwargs["response_format"] == "opus"
+
+    def test_default_output_path_is_unique_with_same_timestamp(
+        self, tmp_path, mock_mistral_module, monkeypatch
+    ):
+        import datetime
+        import json
+
+        from tools.tts_tool import text_to_speech_tool
+
+        fixed_now = datetime.datetime(2026, 4, 17, 22, 11, 45)
+
+        class _FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz is None else fixed_now.replace(tzinfo=tz)
+
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+        mock_mistral_module.audio.speech.complete.return_value = MagicMock(
+            audio_data=base64.b64encode(b"opus-audio").decode()
+        )
+
+        with patch("tools.tts_tool._load_tts_config", return_value={"provider": "mistral"}), \
+             patch("tools.tts_tool.DEFAULT_OUTPUT_DIR", str(tmp_path)), \
+             patch("tools.tts_tool.datetime.datetime", _FixedDateTime):
+            result_one = json.loads(text_to_speech_tool("Hello"))
+            result_two = json.loads(text_to_speech_tool("Hello again"))
+
+        assert result_one["success"] is True
+        assert result_two["success"] is True
+        assert result_one["file_path"] != result_two["file_path"]
+        assert result_one["file_path"].startswith(str(tmp_path / "tts_20260417_221145_"))
+        assert result_two["file_path"].startswith(str(tmp_path / "tts_20260417_221145_"))

@@ -22,9 +22,9 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
-def _make_source() -> SessionSource:
+def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:
     return SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=platform,
         user_id="u1",
         chat_id="c1",
         user_name="tester",
@@ -32,10 +32,10 @@ def _make_source() -> SessionSource:
     )
 
 
-def _make_event(text: str) -> MessageEvent:
+def _make_event(text: str, platform: Platform = Platform.TELEGRAM) -> MessageEvent:
     return MessageEvent(
         text=text,
-        source=_make_source(),
+        source=_make_source(platform),
         message_id="m1",
     )
 
@@ -45,15 +45,23 @@ def _make_runner():
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***"),
+            Platform.WEIXIN: PlatformConfig(enabled=True, token="***"),
+        }
     )
-    adapter = MagicMock()
-    adapter.send = AsyncMock()
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {}
+    for platform in (Platform.TELEGRAM, Platform.WEIXIN):
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.resume_typing_for_chat = MagicMock()
+        runner.adapters[platform] = adapter
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
     runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._busy_ack_ts = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._background_tasks = set()
@@ -62,8 +70,12 @@ def _make_runner():
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._show_reasoning = False
+    runner._draining = False
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
+    runner._get_unauthorized_dm_behavior = lambda _platform: "pair"
+    runner._status_action_gerund = lambda: "restarting"
+    runner._queue_during_drain_enabled = lambda: False
     return runner
 
 
@@ -73,6 +85,7 @@ def _clear_approval_state():
     mod._gateway_queues.clear()
     mod._gateway_notify_cbs.clear()
     mod._session_approved.clear()
+    mod._session_yolo.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
 
@@ -172,23 +185,6 @@ class TestBlockingGatewayApproval:
         unregister_gateway_notify(session_key)
         assert e1.event.is_set()
         assert e2.event.is_set()
-
-    def test_clear_session_denies_and_signals_all_entries(self):
-        """clear_session must wake blocked entries during boundary cleanup."""
-        from tools.approval import clear_session, _ApprovalEntry, _gateway_queues
-
-        session_key = "test-boundary-cleanup"
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
-
-        clear_session(session_key)
-
-        assert e1.event.is_set()
-        assert e2.event.is_set()
-        assert e1.result == "deny"
-        assert e2.result == "deny"
-        assert session_key not in _gateway_queues
 
 
 # ------------------------------------------------------------------
@@ -352,6 +348,87 @@ class TestBareTextNoLongerApproves:
         assert not entry.event.is_set()
 
 
+class TestWeixinApprovalShortcut:
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    @pytest.mark.asyncio
+    async def test_weixin_text_shortcut_approves_once(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source(Platform.WEIXIN)
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_message(_make_event("批准", Platform.WEIXIN))
+
+        assert "approved" in result.lower()
+        assert "resuming" in result.lower()
+        assert entry.event.is_set()
+        assert entry.result == "once"
+        runner.adapters[Platform.WEIXIN].resume_typing_for_chat.assert_called_once_with("c1")
+
+    @pytest.mark.asyncio
+    async def test_weixin_text_shortcut_approves_always(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source(Platform.WEIXIN)
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_message(_make_event("永远批准。", Platform.WEIXIN))
+
+        assert "permanently" in result.lower()
+        assert entry.event.is_set()
+        assert entry.result == "always"
+
+    @pytest.mark.asyncio
+    async def test_weixin_voice_transcript_shortcut_bypasses_interrupt(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source(Platform.WEIXIN)
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+        running_agent = MagicMock()
+        runner._running_agents[session_key] = running_agent
+
+        result = await runner._handle_message(_make_event("approve", Platform.WEIXIN))
+
+        assert "approved" in result.lower()
+        assert entry.event.is_set()
+        running_agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_weixin_shortcut_requires_pending_approval(self):
+        runner = _make_runner()
+
+        result = await runner._handle_weixin_approval_shortcut(_make_event("批准", Platform.WEIXIN))
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_non_weixin_shortcut_is_ignored(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source(Platform.TELEGRAM)
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_weixin_approval_shortcut(_make_event("批准", Platform.TELEGRAM))
+
+        assert result is None
+        assert not entry.event.is_set()
+
+
 # ------------------------------------------------------------------
 # End-to-end blocking flow
 # ------------------------------------------------------------------
@@ -367,6 +444,14 @@ class TestBlockingApprovalE2E:
         os.environ.pop("HERMES_GATEWAY_SESSION", None)
         os.environ.pop("HERMES_EXEC_ASK", None)
         os.environ.pop("HERMES_SESSION_KEY", None)
+        self._tirith_patcher = patch(
+            "tools.tirith_security.check_command_security",
+            return_value={"action": "allow", "findings": [], "summary": ""},
+        )
+        self._tirith_patcher.start()
+
+    def teardown_method(self):
+        self._tirith_patcher.stop()
 
     def test_blocking_approval_approve_once(self):
         """check_all_command_guards blocks until resolve_gateway_approval is called."""

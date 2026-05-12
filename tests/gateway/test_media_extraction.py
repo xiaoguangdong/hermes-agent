@@ -182,3 +182,98 @@ class TestMediaExtraction:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestGatewayRunnerMediaTagCollection:
+    def test_skips_missing_history_media_paths(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        missing = tmp_path / "tts_old.ogg"
+        existing = tmp_path / "tts_new.ogg"
+        existing.write_bytes(b"opus-audio")
+
+        messages = [
+            {
+                "role": "tool",
+                "content": f'{{"media_tag":"[[audio_as_voice]]\\nMEDIA:{missing}"}}',
+            },
+            {
+                "role": "tool",
+                "content": f'{{"media_tag":"[[audio_as_voice]]\\nMEDIA:{existing}"}}',
+            },
+        ]
+
+        media_tags, has_voice_directive = GatewayRunner._collect_media_tags_from_tool_messages(
+            messages,
+            require_existing_files=True,
+        )
+
+        assert media_tags == [f"MEDIA:{existing}"]
+        assert has_voice_directive is True
+
+    def test_excludes_paths_already_seen_in_history(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        existing = tmp_path / "tts_current.ogg"
+        existing.write_bytes(b"opus-audio")
+
+        messages = [
+            {
+                "role": "tool",
+                "content": f'{{"media_tag":"[[audio_as_voice]]\\nMEDIA:{existing}"}}',
+            },
+        ]
+
+        media_tags, has_voice_directive = GatewayRunner._collect_media_tags_from_tool_messages(
+            messages,
+            history_media_paths={str(existing)},
+            require_existing_files=True,
+        )
+
+        assert media_tags == []
+        assert has_voice_directive is False
+
+    def test_sanitize_response_media_tags_strips_history_and_missing_paths(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        history_path = tmp_path / "tts_old.ogg"
+        history_path.write_bytes(b"old-audio")
+        missing_path = tmp_path / "tts_missing.ogg"
+
+        content = (
+            "[[audio_as_voice]]\n"
+            f"MEDIA:{history_path}\n"
+            f"MEDIA:{missing_path}\n\n"
+            "这次我直接说正文。"
+        )
+
+        cleaned = GatewayRunner._sanitize_response_media_tags(
+            content,
+            history_media_paths={str(history_path)},
+            require_existing_files=True,
+        )
+
+        assert cleaned == "这次我直接说正文。"
+
+    def test_sanitize_response_media_tags_keeps_current_existing_media(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        current_path = tmp_path / "tts_current.ogg"
+        current_path.write_bytes(b"new-audio")
+
+        content = (
+            "[[audio_as_voice]]\n"
+            f"MEDIA:{current_path}\n\n"
+            "请收语音。"
+        )
+
+        cleaned = GatewayRunner._sanitize_response_media_tags(
+            content,
+            require_existing_files=True,
+        )
+
+        assert cleaned == (
+            "[[audio_as_voice]]\n"
+            f"MEDIA:{current_path}\n"
+            "请收语音。"
+        )

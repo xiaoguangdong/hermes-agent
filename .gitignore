@@ -4,6 +4,8 @@
 *.pyc*
 __pycache__/
 .venv/
+/.hermes-dev/
+/.uv-cache/
 .vscode/
 .env
 .env.local

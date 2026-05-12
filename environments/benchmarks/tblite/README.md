@@ -49,6 +49,38 @@ python environments/benchmarks/tblite/tblite_env.py evaluate \
     --server.model_name "qwen/qwen3-30b"
 ```
 
+## Local oMLX
+
+For local Mac runs against oMLX, use the serial runner instead of reusing a
+long-lived server by hand:
+
+```bash
+source venv/bin/activate
+
+# Default: qwen3.6-35b-a3b local config
+python scripts/run_omlx_local_eval.py \
+    --task-filter broken-python
+
+# Compare two local models serially without overlapping memory usage
+python scripts/run_omlx_local_eval.py \
+    --config-alias qwen36 \
+    --config-alias supergemma26b \
+    --task-filter broken-python,pandas-etl
+```
+
+Why this wrapper exists:
+
+- It always restarts oMLX before switching models, which avoids 507
+  `Insufficient Storage` errors from previously pinned large models.
+- Hermes already disables proxy inheritance for local OpenAI-compatible
+  endpoints, which avoids the local 502 issue seen with `httpx`/OpenAI SDK
+  requests routed through ambient proxy settings.
+
+Config files:
+
+- `environments/benchmarks/tblite/omlx-local.yaml`
+- `environments/benchmarks/tblite/omlx-local-supergemma26b.yaml`
+
 ## Architecture
 
 `TBLiteEvalEnv` is a thin subclass of `TerminalBench2EvalEnv`. All evaluation logic (agent loop, Docker sandbox management, test verification, metrics) is inherited. Only the defaults differ:

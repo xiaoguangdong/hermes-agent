@@ -1,20 +1,19 @@
 """Tests for the Weixin platform adapter."""
 
 import asyncio
-import base64
 import json
 import os
-from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
-
-import pytest
+import socket
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from gateway.config import PlatformConfig
 from gateway.config import GatewayConfig, HomeChannel, Platform, _apply_env_overrides
-from gateway.platforms.base import SendResult
 from gateway.platforms import weixin
 from gateway.platforms.weixin import ContextTokenStore, WeixinAdapter
+from gateway.platforms.base import SendResult
 from tools.send_message_tool import _parse_target_ref, _send_to_platform
+import pytest
 
 
 def _make_adapter() -> WeixinAdapter:
@@ -27,15 +26,36 @@ def _make_adapter() -> WeixinAdapter:
     )
 
 
+class TestWeixinSendImageFile:
+    @pytest.mark.asyncio
+    async def test_send_image_file_accepts_image_path_keyword(self):
+        adapter = _make_adapter()
+        adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="mid-1"))
+
+        result = await adapter.send_image_file(chat_id="chat-1", image_path="/tmp/demo.png", caption="截图说明")
+
+        assert result.success is True
+        assert result.message_id == "mid-1"
+        adapter.send_document.assert_awaited_once_with(
+            "chat-1",
+            file_path="/tmp/demo.png",
+            caption="截图说明",
+            metadata=None,
+        )
+
+
 class TestWeixinFormatting:
-    def test_format_message_preserves_markdown(self):
+    def test_format_message_preserves_markdown_and_rewrites_headers(self):
         adapter = _make_adapter()
 
         content = "# Title\n\n## Plan\n\nUse **bold** and [docs](https://example.com)."
 
-        assert adapter.format_message(content) == content
+        assert (
+            adapter.format_message(content)
+            == "【Title】\n\n**Plan**\n\nUse **bold** and docs (https://example.com)."
+        )
 
-    def test_format_message_preserves_markdown_tables(self):
+    def test_format_message_rewrites_markdown_tables(self):
         adapter = _make_adapter()
 
         content = (
@@ -45,36 +65,19 @@ class TestWeixinFormatting:
             "| Retries | 3 |\n"
         )
 
-        assert adapter.format_message(content) == content.strip()
+        assert adapter.format_message(content) == (
+            "- Setting: Timeout\n"
+            "  Value: 30s\n"
+            "- Setting: Retries\n"
+            "  Value: 3"
+        )
 
     def test_format_message_preserves_fenced_code_blocks(self):
         adapter = _make_adapter()
 
         content = "## Snippet\n\n```python\nprint('hi')\n```"
 
-        assert adapter.format_message(content) == content
-
-    def test_format_message_wraps_long_plain_lines_for_copying(self):
-        adapter = _make_adapter()
-
-        content = (
-            "Here is a long issue template line with many copyable fields "
-            + " ".join(f"field_{idx}=value_{idx}" for idx in range(24))
-        )
-
-        formatted = adapter.format_message(content)
-
-        assert "\n" in formatted
-        assert all(len(line) <= weixin.WEIXIN_COPY_LINE_WIDTH for line in formatted.splitlines())
-        assert " ".join(formatted.split()) == " ".join(content.split())
-
-    def test_format_message_does_not_wrap_long_code_block_lines(self):
-        adapter = _make_adapter()
-
-        command = "hermes " + " ".join(f"--option-{idx}=value" for idx in range(30))
-        content = f"```bash\n{command}\n```"
-
-        assert adapter.format_message(content) == content
+        assert adapter.format_message(content) == "**Snippet**\n\n```python\nprint('hi')\n```"
 
     def test_format_message_returns_empty_string_for_none(self):
         adapter = _make_adapter()
@@ -120,7 +123,7 @@ class TestWeixinChunking:
         content = adapter.format_message("## 结论\n这是正文")
         chunks = adapter._split_text(content)
 
-        assert chunks == ["## 结论\n这是正文"]
+        assert chunks == ["**结论**\n这是正文"]
 
     def test_split_text_keeps_short_reformatted_table_in_single_chunk(self):
         adapter = _make_adapter()
@@ -303,33 +306,53 @@ class TestWeixinStatePersistence:
         assert json.loads(sync_path.read_text(encoding="utf-8")) == {"get_updates_buf": "old-sync"}
 
 
-class TestWeixinQrLogin:
-    @pytest.mark.asyncio
-    async def test_qr_login_timeout_uses_monotonic_clock(self, tmp_path):
-        first_qr = {
-            "qrcode": "qr-1",
-            "qrcode_img_content": "https://example.com/qr-1",
-        }
-        pending = {"status": "wait"}
+class TestWeixinDnsFallback:
+    class _BrokenSession:
+        def get(self, *args, **kwargs):
+            raise weixin.aiohttp.ClientConnectorDNSError(None, socket.gaierror(8, "dns failed"))
 
-        with patch("gateway.platforms.weixin._api_get", new_callable=AsyncMock) as api_get_mock, \
-             patch("gateway.platforms.weixin.time") as mock_time, \
-             patch("gateway.platforms.weixin.AIOHTTP_AVAILABLE", True), \
-             patch("gateway.platforms.weixin.aiohttp.ClientSession", create=True) as session_cls, \
-             patch("builtins.print"):
-            api_get_mock.side_effect = [first_qr, pending]
-            mock_time.monotonic.side_effect = [1000, 1000.2, 1001.1]
-            mock_time.time.side_effect = [1000, 900, 901, 902]
+        def post(self, *args, **kwargs):
+            raise weixin.aiohttp.ClientConnectorDNSError(None, socket.gaierror(8, "dns failed"))
 
-            session = AsyncMock()
-            session.__aenter__.return_value = session
-            session.__aexit__.return_value = False
-            session_cls.return_value = session
+    class _FakeResponse:
+        def __init__(self, payload: dict):
+            self.status_code = 200
+            self.ok = True
+            self.text = json.dumps(payload)
 
-            result = await weixin.qr_login(str(tmp_path), timeout_seconds=1)
+    @patch("gateway.platforms.weixin.requests.get")
+    def test_api_get_falls_back_to_requests_on_dns_error(self, requests_get):
+        requests_get.return_value = self._FakeResponse({"ret": 0, "status": "wait"})
 
-        assert result is None
-        assert api_get_mock.await_count == 2
+        result = asyncio.run(
+            weixin._api_get(
+                self._BrokenSession(),
+                base_url="https://ilink.example.com",
+                endpoint="ilink/bot/get_qrcode_status?qrcode=test",
+                timeout_ms=1000,
+            )
+        )
+
+        assert result == {"ret": 0, "status": "wait"}
+        requests_get.assert_called_once()
+
+    @patch("gateway.platforms.weixin.requests.post")
+    def test_api_post_falls_back_to_requests_on_dns_error(self, requests_post):
+        requests_post.return_value = self._FakeResponse({"ret": 0, "ok": True})
+
+        result = asyncio.run(
+            weixin._api_post(
+                self._BrokenSession(),
+                base_url="https://ilink.example.com",
+                endpoint="ilink/bot/sendmessage",
+                payload={"hello": "world"},
+                token="test-token",
+                timeout_ms=1000,
+            )
+        )
+
+        assert result == {"ret": 0, "ok": True}
+        requests_post.assert_called_once()
 
 
 class TestWeixinSendMessageIntegration:
@@ -366,7 +389,6 @@ class TestWeixinChunkDelivery:
     def _connected_adapter(self) -> WeixinAdapter:
         adapter = _make_adapter()
         adapter._session = object()
-        adapter._send_session = adapter._session
         adapter._token = "test-token"
         adapter._base_url = "https://weixin.example.com"
         adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
@@ -411,116 +433,32 @@ class TestWeixinChunkDelivery:
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
 
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_recreates_session_on_retryable_transport_error(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        adapter._session = AsyncMock()
+        adapter._session.closed = False
 
-class TestWeixinOutboundMedia:
-    def test_send_image_file_accepts_keyword_image_path(self):
-        adapter = _make_adapter()
-        expected = SendResult(success=True, message_id="msg-1")
-        adapter.send_document = AsyncMock(return_value=expected)
+        class FakeDisconnect(weixin.aiohttp.ServerDisconnectedError):
+            pass
 
-        result = asyncio.run(
-            adapter.send_image_file(
-                chat_id="wxid_test123",
-                image_path="/tmp/demo.png",
-                caption="截图说明",
-                reply_to="reply-1",
-                metadata={"thread_id": "t-1"},
-            )
-        )
+        calls = {"count": 0}
 
-        assert result == expected
-        adapter.send_document.assert_awaited_once_with(
-            chat_id="wxid_test123",
-            file_path="/tmp/demo.png",
-            caption="截图说明",
-            metadata={"thread_id": "t-1"},
-        )
+        async def flaky_send(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise FakeDisconnect()
 
-    def test_send_document_accepts_keyword_file_path(self):
-        adapter = _make_adapter()
-        adapter._session = object()
-        adapter._send_session = adapter._session
-        adapter._token = "test-token"
-        adapter._send_file = AsyncMock(return_value="msg-2")
+        send_message_mock.side_effect = flaky_send
 
-        result = asyncio.run(
-            adapter.send_document(
-                chat_id="wxid_test123",
-                file_path="/tmp/report.pdf",
-                caption="报告请看",
-                file_name="renamed.pdf",
-                reply_to="reply-1",
-                metadata={"thread_id": "t-1"},
-            )
-        )
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
 
         assert result.success is True
-        assert result.message_id == "msg-2"
-        adapter._send_file.assert_awaited_once_with("wxid_test123", "/tmp/report.pdf", "报告请看")
-
-    def test_send_file_uses_post_for_upload_full_url_and_hex_encoded_aes_key(self, tmp_path):
-        class _UploadResponse:
-            def __init__(self):
-                self.status = 200
-                self.headers = {"x-encrypted-param": "enc-param"}
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            async def read(self):
-                return b""
-
-            async def text(self):
-                return ""
-
-        class _RecordingSession:
-            def __init__(self):
-                self.post_calls = []
-
-            def post(self, url, **kwargs):
-                self.post_calls.append((url, kwargs))
-                return _UploadResponse()
-
-            def put(self, *_args, **_kwargs):
-                raise AssertionError("upload_full_url branch should use POST")
-
-        image_path = tmp_path / "demo.png"
-        image_path.write_bytes(b"fake-png-bytes")
-
-        adapter = _make_adapter()
-        session = _RecordingSession()
-        adapter._session = session
-        adapter._send_session = session
-        adapter._token = "test-token"
-        adapter._base_url = "https://weixin.example.com"
-        adapter._cdn_base_url = "https://cdn.example.com/c2c"
-        adapter._token_store.get = lambda account_id, chat_id: None
-
-        aes_key = bytes(range(16))
-        expected_aes_key = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
-
-        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
-             patch("gateway.platforms.weixin._api_post", new_callable=AsyncMock) as api_post_mock, \
-             patch("gateway.platforms.weixin.secrets.token_hex", return_value="filekey-123"), \
-             patch("gateway.platforms.weixin.secrets.token_bytes", return_value=aes_key):
-            message_id = asyncio.run(adapter._send_file("wxid_test123", str(image_path), ""))
-
-        assert message_id.startswith("hermes-weixin-")
-        assert len(session.post_calls) == 1
-        upload_url, upload_kwargs = session.post_calls[0]
-        assert upload_url == "https://upload.example.com/media"
-        assert upload_kwargs["headers"] == {"Content-Type": "application/octet-stream"}
-        assert upload_kwargs["data"]
-        # Timeout is now enforced externally via asyncio.wait_for() rather than
-        # aiohttp.ClientTimeout, so it no longer appears as a post() kwarg.
-        assert "timeout" not in upload_kwargs
-        payload = api_post_mock.await_args.kwargs["payload"]
-        media = payload["msg"]["item_list"][0]["image_item"]["media"]
-        assert media["encrypt_query_param"] == "enc-param"
-        assert media["aes_key"] == expected_aes_key
+        assert send_message_mock.await_count == 2
+        assert adapter._session is not None
+        if adapter._session and hasattr(adapter._session, "close"):
+            asyncio.run(adapter._session.close())
 
 
 class TestWeixinRemoteMediaSafety:
@@ -537,13 +475,16 @@ class TestWeixinRemoteMediaSafety:
 
 
 class TestWeixinMarkdownLinks:
-    """Markdown links should be preserved so WeChat can render them natively."""
+    """Markdown links should be converted to plaintext since WeChat can't render them."""
 
-    def test_format_message_preserves_markdown_links(self):
+    def test_format_message_converts_markdown_links_to_plain_text(self):
         adapter = _make_adapter()
 
         content = "Check [the docs](https://example.com) and [GitHub](https://github.com) for details"
-        assert adapter.format_message(content) == content
+        assert (
+            adapter.format_message(content)
+            == "Check the docs (https://example.com) and GitHub (https://github.com) for details"
+        )
 
     def test_format_message_preserves_links_inside_code_blocks(self):
         adapter = _make_adapter()
@@ -587,7 +528,6 @@ class TestWeixinBlankMessagePrevention:
     def test_send_empty_content_does_not_call_send_message(self, send_message_mock):
         adapter = _make_adapter()
         adapter._session = object()
-        adapter._send_session = adapter._session
         adapter._token = "test-token"
         adapter._base_url = "https://weixin.example.com"
         adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
@@ -658,10 +598,10 @@ class TestWeixinMediaBuilder:
         )
         assert item["video_item"]["video_md5"] == "deadbeef"
 
-    def test_voice_builder_for_audio_files_uses_file_attachment_type(self):
+    def test_voice_builder_for_audio_files(self):
         adapter = _make_adapter()
         media_type, builder = adapter._outbound_media_builder("note.mp3")
-        assert media_type == weixin.MEDIA_FILE
+        assert media_type == weixin.MEDIA_VOICE
 
         item = builder(
             encrypt_query_param="eq",
@@ -671,112 +611,16 @@ class TestWeixinMediaBuilder:
             filename="note.mp3",
             rawfilemd5="abc",
         )
-        assert item["type"] == weixin.ITEM_FILE
-        assert item["file_item"]["file_name"] == "note.mp3"
+        assert item["type"] == weixin.ITEM_VOICE
+        assert "voice_item" in item
+        assert item["voice_item"]["encode_type"] == weixin.VOICE_ENCODE_MP3
+        assert item["voice_item"]["bits_per_sample"] == 16
+        assert item["voice_item"]["sample_rate"] == 24000
 
     def test_voice_builder_for_silk_files(self):
         adapter = _make_adapter()
         media_type, builder = adapter._outbound_media_builder("recording.silk")
         assert media_type == weixin.MEDIA_VOICE
-
-
-class TestWeixinSendImageFileParameterName:
-    """Regression test for send_image_file parameter name mismatch.
-
-    The gateway calls send_image_file(chat_id=..., image_path=...) but the
-    WeixinAdapter previously used 'path' as the parameter name, causing
-    image sending to fail. This test ensures the interface stays correct.
-    """
-
-    @patch.object(WeixinAdapter, "send_document", new_callable=AsyncMock)
-    def test_send_image_file_uses_image_path_parameter(self, send_document_mock):
-        """Verify send_image_file accepts image_path and forwards to send_document."""
-        adapter = _make_adapter()
-        adapter._session = object()
-        adapter._send_session = adapter._session
-        adapter._token = "test-token"
-
-        send_document_mock.return_value = weixin.SendResult(success=True, message_id="test-id")
-
-        # This is the call pattern used by gateway/run.py extract_media
-        result = asyncio.run(
-            adapter.send_image_file(
-                chat_id="wxid_test123",
-                image_path="/tmp/test_image.png",
-                caption="Test caption",
-                metadata={"thread_id": "thread-123"},
-            )
-        )
-
-        assert result.success is True
-        send_document_mock.assert_awaited_once_with(
-            chat_id="wxid_test123",
-            file_path="/tmp/test_image.png",
-            caption="Test caption",
-            metadata={"thread_id": "thread-123"},
-        )
-
-    @patch.object(WeixinAdapter, "send_document", new_callable=AsyncMock)
-    def test_send_image_file_works_without_optional_params(self, send_document_mock):
-        """Verify send_image_file works with minimal required params."""
-        adapter = _make_adapter()
-        adapter._session = object()
-        adapter._send_session = adapter._session
-        adapter._token = "test-token"
-
-        send_document_mock.return_value = weixin.SendResult(success=True, message_id="test-id")
-
-        result = asyncio.run(
-            adapter.send_image_file(
-                chat_id="wxid_test123",
-                image_path="/tmp/test_image.jpg",
-            )
-        )
-
-        assert result.success is True
-        send_document_mock.assert_awaited_once_with(
-            chat_id="wxid_test123",
-            file_path="/tmp/test_image.jpg",
-            caption=None,
-            metadata=None,
-        )
-
-
-class TestWeixinVoiceSending:
-    def _connected_adapter(self) -> WeixinAdapter:
-        adapter = _make_adapter()
-        adapter._session = object()
-        adapter._send_session = adapter._session
-        adapter._token = "test-token"
-        adapter._base_url = "https://weixin.example.com"
-        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
-        return adapter
-
-    @patch.object(WeixinAdapter, "_send_file", new_callable=AsyncMock)
-    def test_send_voice_downgrades_to_document_attachment(self, send_file_mock, tmp_path):
-        adapter = self._connected_adapter()
-        source = tmp_path / "voice.ogg"
-        source.write_bytes(b"ogg")
-        send_file_mock.return_value = "msg-1"
-
-        result = asyncio.run(adapter.send_voice("wxid_test123", str(source)))
-
-        assert result.success is True
-        send_file_mock.assert_awaited_once_with(
-            "wxid_test123",
-            str(source),
-            "[voice message as attachment]",
-            force_file_attachment=True,
-        )
-
-    def test_voice_builder_for_silk_files_can_be_forced_to_file_attachment(self):
-        adapter = _make_adapter()
-        media_type, builder = adapter._outbound_media_builder(
-            "recording.silk",
-            force_file_attachment=True,
-        )
-        assert media_type == weixin.MEDIA_FILE
-
         item = builder(
             encrypt_query_param="eq",
             aes_key_for_api="fakekey",
@@ -785,101 +629,90 @@ class TestWeixinVoiceSending:
             filename="recording.silk",
             rawfilemd5="abc",
         )
-        assert item["type"] == weixin.ITEM_FILE
-        assert item["file_item"]["file_name"] == "recording.silk"
+        assert item["voice_item"]["encode_type"] == weixin.VOICE_ENCODE_SILK
+        assert item["voice_item"]["bits_per_sample"] == 16
+        assert item["voice_item"]["sample_rate"] == 24000
 
-    @patch.object(weixin, "_api_post", new_callable=AsyncMock)
-    @patch.object(weixin, "_upload_ciphertext", new_callable=AsyncMock)
-    @patch.object(weixin, "_get_upload_url", new_callable=AsyncMock)
-    def test_send_file_sets_voice_metadata_for_silk_payload(
-        self,
-        get_upload_url_mock,
-        upload_ciphertext_mock,
-        api_post_mock,
-        tmp_path,
-    ):
-        adapter = self._connected_adapter()
+
+class TestWeixinVoiceUpload:
+    def test_prepare_voice_upload_transcodes_to_silk(self, tmp_path):
+        adapter = _make_adapter()
+        src = tmp_path / "voice.ogg"
+        src.write_bytes(b"fake-ogg")
+
+        def _fake_ffmpeg(cmd, check, capture_output, text, timeout):
+            wav_path = cmd[-1]
+            with open(wav_path, "wb") as handle:
+                handle.write(b"RIFFfakewav")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        class _FakeSilkEncoder:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def encode(self, wav_path, silk_path, tencent=False):
+                assert tencent is True
+                with open(silk_path, "wb") as handle:
+                    handle.write(b"\x02#!SILK_V3fake")
+                return 2
+
+        fake_pilk = SimpleNamespace(SilkEncoder=_FakeSilkEncoder)
+
+        with patch("gateway.platforms.weixin.shutil.which", return_value="/opt/homebrew/bin/ffmpeg"), \
+             patch("gateway.platforms.weixin.subprocess.run", side_effect=_fake_ffmpeg), \
+             patch.dict("sys.modules", {"pilk": fake_pilk}):
+            silk_path, cleanup_paths = asyncio.run(adapter._prepare_voice_upload(str(src)))
+
+        assert silk_path.endswith(".silk")
+        assert os.path.exists(silk_path)
+        assert cleanup_paths == [
+            os.path.join(os.path.dirname(silk_path), "voice.wav"),
+            silk_path,
+        ]
+
+    def test_send_voice_uses_transcoded_silk_and_cleans_up(self, tmp_path):
+        adapter = _make_adapter()
+        src = tmp_path / "voice.ogg"
+        src.write_bytes(b"fake-ogg")
+        wav = tmp_path / "voice.wav"
+        wav.write_bytes(b"fake-wav")
         silk = tmp_path / "voice.silk"
-        silk.write_bytes(b"\x02#!SILK_V3\x01\x00")
-        get_upload_url_mock.return_value = {"upload_full_url": "https://cdn.example.com/upload"}
-        upload_ciphertext_mock.return_value = "enc-q"
-        api_post_mock.return_value = {"success": True}
+        silk.write_bytes(b"\x02#!SILK_V3fake")
 
-        asyncio.run(adapter._send_file("wxid_test123", str(silk), ""))
+        adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+        adapter._prepare_voice_upload = AsyncMock(return_value=(str(silk), [str(wav), str(silk)]))
+        adapter._get_audio_duration_ms = AsyncMock(return_value=3210)
 
-        payload = api_post_mock.await_args.kwargs["payload"]
-        voice_item = payload["msg"]["item_list"][0]["voice_item"]
-        assert voice_item.get("playtime", 0) == 0
-        assert voice_item["encode_type"] == 6
-        assert voice_item["sample_rate"] == 24000
-        assert voice_item["bits_per_sample"] == 16
+        result = asyncio.run(adapter.send_voice("chat-1", str(src), caption="hello"))
 
+        assert result.success is True
+        adapter.send_document.assert_awaited_once_with(
+            "chat-1",
+            str(silk),
+            caption="hello",
+            metadata=None,
+            playtime_ms=3210,
+        )
+        assert not wav.exists()
+        assert not silk.exists()
 
-class TestIsStaleSessionRet:
-    """Regression test for #17228: distinguish stale-session ret=-2 from rate-limit ret=-2."""
-
-    def test_ret_minus_2_with_unknown_error_is_stale(self):
-        assert weixin._is_stale_session_ret(-2, None, "unknown error") is True
-
-    def test_errcode_minus_2_with_unknown_error_is_stale(self):
-        assert weixin._is_stale_session_ret(None, -2, "unknown error") is True
-
-    def test_unknown_error_case_insensitive(self):
-        assert weixin._is_stale_session_ret(-2, None, "Unknown Error") is True
-
-    def test_ret_minus_2_with_freq_limit_is_not_stale(self):
-        # Genuine rate limit — must NOT be treated as stale session.
-        assert weixin._is_stale_session_ret(-2, None, "freq limit") is False
-
-    def test_ret_minus_2_with_no_errmsg_is_not_stale(self):
-        assert weixin._is_stale_session_ret(-2, None, None) is False
-        assert weixin._is_stale_session_ret(-2, None, "") is False
-
-    def test_errcode_minus_14_is_not_matched_here(self):
-        # -14 is handled by the separate SESSION_EXPIRED_ERRCODE path; the
-        # helper only disambiguates -2 from a genuine rate limit.
-        assert weixin._is_stale_session_ret(-14, None, "session expired") is False
-
-    def test_success_codes_are_not_stale(self):
-        assert weixin._is_stale_session_ret(0, 0, "") is False
-        assert weixin._is_stale_session_ret(None, None, "unknown error") is False
-
-
-class TestWeixinContentDedup:
-    """Regression tests for Issue #16182 — upstream API sends duplicate content
-    with different message_ids, bypassing message_id deduplication.
-    """
-
-    def test_duplicate_content_with_different_message_ids_is_dropped(self):
+    def test_send_voice_falls_back_to_original_audio_when_transcode_fails(self, tmp_path):
         adapter = _make_adapter()
-        adapter._poll_session = object()
-        adapter.handle_message = AsyncMock()
+        src = tmp_path / "voice.ogg"
+        src.write_bytes(b"fake-ogg")
 
-        base_msg = {
-            "from_user_id": "wxid_user1",
-            "item_list": [{"type": 1, "text_item": {"text": "hello world"}}],
-        }
+        adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+        adapter._prepare_voice_upload = AsyncMock(side_effect=RuntimeError("boom"))
+        adapter._get_audio_duration_ms = AsyncMock(return_value=3210)
 
-        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-1"}))
-        asyncio.run(adapter._process_message({**base_msg, "message_id": "msg-2"}))
+        result = asyncio.run(adapter.send_voice("chat-1", str(src), caption="hello"))
 
-        assert adapter.handle_message.await_count == 1
-        event = adapter.handle_message.await_args[0][0]
-        assert event.text == "hello world"
-
-    def test_content_dedup_not_called_for_messages_without_text(self):
-        adapter = _make_adapter()
-        adapter._poll_session = object()
-        adapter.handle_message = AsyncMock()
-        adapter._dedup.is_duplicate = Mock(return_value=False)
-
-        empty_msg = {
-            "from_user_id": "wxid_user1",
-            "message_id": "msg-1",
-            "item_list": [],
-        }
-        asyncio.run(adapter._process_message(empty_msg))
-
-        assert adapter.handle_message.await_count == 0
-        # is_duplicate should only be called for message_id, never for content
-        assert all("content:" not in str(call) for call in adapter._dedup.is_duplicate.call_args_list)
+        assert result.success is True
+        adapter.send_document.assert_awaited_once_with(
+            "chat-1",
+            str(src),
+            caption="hello",
+            metadata=None,
+            playtime_ms=3210,
+        )
+        assert src.exists()

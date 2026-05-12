@@ -23,8 +23,6 @@ from run_agent import AIAgent
 
 def _make_agent():
     return AIAgent(
-        api_key="test-key",
-        base_url="https://openrouter.ai/api/v1",
         model="test/model",
         quiet_mode=True,
         skip_context_files=True,
@@ -186,3 +184,24 @@ def test_replace_primary_openai_client_survives_repeated_rebuilds():
         "Some _create_openai_client calls returned the same object across "
         "a teardown — rebuild is not producing fresh clients"
     )
+
+
+def test_local_create_openai_client_disables_proxy_inheritance():
+    agent = _make_agent()
+    constructed: list = []
+    fake_openai = _make_fake_openai_factory(constructed)
+
+    agent._client_kwargs = {
+        "api_key": "test-key-value",
+        "base_url": "http://127.0.0.1:18000/v1",
+    }
+
+    with patch("run_agent.OpenAI", fake_openai):
+        client = agent._create_openai_client(
+            agent._client_kwargs, reason="local", shared=True
+        )
+
+    http_client = client._http_client
+    assert http_client is not None
+    assert getattr(http_client, "_trust_env", None) is False
+    client.close()

@@ -79,40 +79,57 @@ class TestResolveCdpOverride:
         )
 
 
-class TestGetCdpOverride:
-    def test_prefers_env_var_over_config(self, monkeypatch):
-        import tools.browser_tool as browser_tool
-
-        monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
-        monkeypatch.setattr(
-            browser_tool,
-            "read_raw_config",
-            lambda: {"browser": {"cdp_url": "http://config-host:9222"}},
-            raising=False,
-        )
+class TestProbeCdpEndpoint:
+    def test_reports_ready_when_discovery_returns_websocket(self):
+        from tools.browser_tool import probe_cdp_endpoint
 
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
 
         with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
-            resolved = browser_tool._get_cdp_override()
+            result = probe_cdp_endpoint(HTTP_URL)
 
-        assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+        assert result["ok"] is True
+        assert result["status"] == "ready"
+        assert result["resolved_url"] == WS_URL
+        assert result["version_url"] == VERSION_URL
+        mock_get.assert_called_once_with(VERSION_URL, timeout=3)
 
-    def test_uses_config_browser_cdp_url_when_env_missing(self, monkeypatch):
-        import tools.browser_tool as browser_tool
+    def test_reports_port_open_when_discovery_fails_but_socket_connects(self):
+        from tools.browser_tool import probe_cdp_endpoint
 
-        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        fake_socket = Mock()
+        fake_socket.connect.return_value = None
+        fake_socket.close.return_value = None
 
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")), \
+             patch("tools.browser_tool.socket.socket", return_value=fake_socket):
+            result = probe_cdp_endpoint(HTTP_URL)
 
-        with patch("hermes_cli.config.read_raw_config", return_value={"browser": {"cdp_url": HTTP_URL}}), \
-             patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
-            resolved = browser_tool._get_cdp_override()
+        assert result["ok"] is False
+        assert result["status"] == "port_open_discovery_failed"
+        assert "boom" in result["message"]
+        fake_socket.connect.assert_called_once_with((HOST, PORT))
 
-        assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+    def test_reports_unreachable_when_discovery_and_socket_fail(self):
+        from tools.browser_tool import probe_cdp_endpoint
+
+        fake_socket = Mock()
+        fake_socket.connect.side_effect = OSError("refused")
+
+        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")), \
+             patch("tools.browser_tool.socket.socket", return_value=fake_socket):
+            result = probe_cdp_endpoint(HTTP_URL)
+
+        assert result["ok"] is False
+        assert result["status"] == "unreachable"
+        assert "boom" in result["message"]
+
+    def test_reports_invalid_for_bad_port(self):
+        from tools.browser_tool import probe_cdp_endpoint
+
+        result = probe_cdp_endpoint("http://example-host:notaport")
+
+        assert result["ok"] is False
+        assert result["status"] == "invalid"
