@@ -13,6 +13,8 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+import importlib
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -234,6 +236,27 @@ class TestCommandBypassActiveSession:
         assert any("handled:help" in r for r in adapter.sent_responses), (
             "/help response was not sent back to the user"
         )
+
+    @pytest.mark.asyncio
+    async def test_bypass_guard_falls_back_when_commands_helper_import_breaks(self, monkeypatch):
+        """/help should still bypass even if hermes_cli.commands helper lookup breaks."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        real_import_module = importlib.import_module
+
+        def _boom(name, package=None):
+            if name == "hermes_cli.commands":
+                raise ImportError("synthetic import failure")
+            return real_import_module(name, package)
+
+        monkeypatch.setattr(importlib, "import_module", _boom)
+
+        await adapter.handle_message(_make_event("/help"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:help" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
     async def test_update_bypasses_guard(self):

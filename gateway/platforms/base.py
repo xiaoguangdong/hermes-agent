@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import importlib
 import inspect
 import ipaddress
 import logging
@@ -34,13 +35,30 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+_ACTIVE_SESSION_BYPASS_FALLBACK = frozenset(
+    {
+        "agents",
+        "approve",
+        "background",
+        "commands",
+        "deny",
+        "help",
+        "new",
+        "profile",
+        "queue",
+        "restart",
+        "status",
+        "steer",
+        "stop",
+        "update",
+    }
+)
 
 
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
     return str(value or "").lower()
-
 
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -50,6 +68,33 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _should_bypass_active_session_command(command_name: str | None) -> bool:
+    """Resolve active-session bypass with an in-module fallback.
+
+    Gateway hot paths should not fail closed if ``hermes_cli.commands`` is in a
+    partially initialized state during startup or reload. Prefer the canonical
+    helper when it is importable, then fall back to ``resolve_command``, and
+    finally to the known subset with dedicated gateway handlers.
+    """
+    if not command_name:
+        return False
+    try:
+        commands_mod = importlib.import_module("hermes_cli.commands")
+        helper = getattr(commands_mod, "should_bypass_active_session", None)
+        if callable(helper):
+            return bool(helper(command_name))
+        resolver = getattr(commands_mod, "resolve_command", None)
+        if callable(resolver):
+            return resolver(command_name) is not None
+    except Exception:
+        logger.warning(
+            "Falling back to local active-session bypass set for '/%s'",
+            command_name,
+            exc_info=True,
+        )
+    return command_name in _ACTIVE_SESSION_BYPASS_FALLBACK
 
 
 def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
@@ -4271,9 +4316,8 @@ class BasePlatformAdapter(ABC):
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
             cmd = event.get_command()
-            from hermes_cli.commands import should_bypass_active_session
 
-            if should_bypass_active_session(cmd):
+            if _should_bypass_active_session_command(cmd):
                 # /stop, /new, /reset must cancel the in-flight adapter task
                 # and preserve ordering of queued follow-ups.  Route those
                 # through the dedicated handoff path that serializes

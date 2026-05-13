@@ -3096,6 +3096,45 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     conn.close()
 
 
+def test_connect_tolerates_database_locked_during_wal_probe(kanban_home, monkeypatch, caplog):
+    """kanban_db.connect() should not fail if WAL probe hits 'database is locked'.
+
+    Startup races can briefly lock the DB while another process/connection is
+    touching journal mode. The gateway should keep using the existing journal
+    mode instead of surfacing a noisy dispatcher error.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    _kb._INITIALIZED_PATHS.clear()
+    real_connect = _kb.sqlite3.connect
+
+    class _LockedWalConnection(_kb.sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            normalized = sql.lower().replace(" ", "")
+            if "pragmajournal_mode=wal" in normalized:
+                raise _kb.sqlite3.OperationalError("database is locked")
+            return super().execute(sql, *args, **kwargs)
+
+    def _connect(*args, **kwargs):
+        return real_connect(*args, factory=_LockedWalConnection, **kwargs)
+
+    monkeypatch.setattr(_kb.sqlite3, "connect", _connect)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
+        conn = _kb.connect()
+
+    try:
+        task_id = _kb.create_task(conn, title="locked-wal-probe task")
+        tasks = _kb.list_tasks(conn)
+        assert any(row.id == task_id for row in tasks)
+        assert any(
+            "journal_mode probe skipped because database is locked" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        conn.close()
+
+
 def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     """Regression test for issue #22459.
 
