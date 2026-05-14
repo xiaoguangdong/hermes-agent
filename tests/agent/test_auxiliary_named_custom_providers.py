@@ -119,6 +119,42 @@ class TestResolveProviderClientMainAlias:
         assert model == "gpt-5.4"
         assert mock_openai.called
 
+    def test_main_runtime_override_carries_named_provider_endpoint(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "relay-key")
+        _write_config(tmp_path, {
+            "model": {
+                "default": "gpt-5.5",
+                "provider": "OpenAI",
+                "base_url": "https://relay.example.com/v1",
+                "api_mode": "codex_responses",
+            },
+            "providers": {
+                "OpenAI": {
+                    "name": "OpenAI",
+                    "base_url": "https://relay.example.com/v1",
+                    "key_env": "OPENAI_API_KEY",
+                    "transport": "codex_responses",
+                    "default_model": "gpt-5.5",
+                },
+            },
+        })
+        from agent.auxiliary_client import clear_runtime_main, resolve_provider_client, set_runtime_main
+        try:
+            set_runtime_main(
+                "OpenAI",
+                "gpt-5.5",
+                base_url="https://relay.example.com/v1",
+                api_key="relay-key",
+                api_mode="codex_responses",
+            )
+            client, model = resolve_provider_client("main", "gpt-5.5")
+        finally:
+            clear_runtime_main()
+
+        assert client is not None
+        assert model == "gpt-5.5"
+        assert "relay.example.com" in str(client.base_url)
+
 
 class TestResolveProviderClientNamedCustom:
     """resolve_provider_client should resolve named custom providers directly."""

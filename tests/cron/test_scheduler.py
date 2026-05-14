@@ -1605,6 +1605,67 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         assert fake_db.close.call_count == 2
 
+    def test_run_job_tolerates_missing_cron_contextvars_in_var_map(self, tmp_path, monkeypatch):
+        job = {
+            "id": "test-job",
+            "name": "test",
+            "prompt": "hello",
+            "deliver": "telegram:-2002",
+        }
+        fake_db = MagicMock()
+        seen = {}
+
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                from gateway.session_context import get_session_env
+                seen["platform"] = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None
+                seen["chat_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None
+                seen["thread_id"] = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None
+                return {"final_response": "ok"}
+
+        from gateway import session_context as sc
+        original_var_map = dict(sc._VAR_MAP)
+        trimmed_var_map = {
+            key: value
+            for key, value in original_var_map.items()
+            if not key.startswith("HERMES_CRON_AUTO_DELIVER_")
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent), \
+             patch.object(sc, "_VAR_MAP", trimmed_var_map):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        assert seen == {
+            "platform": "telegram",
+            "chat_id": "-2002",
+            "thread_id": None,
+        }
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
+        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+
 
 class TestRunJobConfigLogging:
     """Verify that config.yaml parse failures are logged, not silently swallowed."""

@@ -1158,6 +1158,7 @@ class WeixinAdapter(BasePlatformAdapter):
         self._send_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
+        self._send_rate_limited_until: Dict[str, float] = {}
 
         self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
         self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
@@ -1735,6 +1736,17 @@ class WeixinAdapter(BasePlatformAdapter):
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
             try:
+                rate_limited_until = self._send_rate_limited_until.get(chat_id, 0.0)
+                now = time.monotonic()
+                if rate_limited_until > now:
+                    wait_remaining = rate_limited_until - now
+                    logger.warning(
+                        "[%s] send cooldown active for %s; waiting %.1fs before retry",
+                        self.name,
+                        _safe_id(chat_id),
+                        wait_remaining,
+                    )
+                    await asyncio.sleep(wait_remaining)
                 resp = await _send_message(
                     self._send_session,
                     base_url=self._base_url,
@@ -1785,6 +1797,7 @@ class WeixinAdapter(BasePlatformAdapter):
                             if attempt >= self._send_chunk_retries:
                                 break
                             wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                            self._send_rate_limited_until[chat_id] = time.monotonic() + wait
                             logger.warning(
                                 "[%s] rate limited for %s; backing off %.1fs before retry",
                                 self.name, _safe_id(chat_id), wait,
@@ -1796,6 +1809,7 @@ class WeixinAdapter(BasePlatformAdapter):
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
                 self._reset_rate_limit_circuit()
+                self._send_rate_limited_until.pop(chat_id, None)
                 return
             except Exception as exc:
                 last_error = exc

@@ -1904,6 +1904,22 @@ def clear_runtime_main() -> None:
     _RUNTIME_MAIN_API_MODE = ""
 
 
+def _read_runtime_main() -> Dict[str, str]:
+    """Return the live runtime override recorded by ``set_runtime_main``."""
+    runtime: Dict[str, str] = {}
+    if isinstance(_RUNTIME_MAIN_PROVIDER, str) and _RUNTIME_MAIN_PROVIDER.strip():
+        runtime["provider"] = _RUNTIME_MAIN_PROVIDER.strip().lower()
+    if isinstance(_RUNTIME_MAIN_MODEL, str) and _RUNTIME_MAIN_MODEL.strip():
+        runtime["model"] = _RUNTIME_MAIN_MODEL.strip()
+    if isinstance(_RUNTIME_MAIN_BASE_URL, str) and _RUNTIME_MAIN_BASE_URL.strip():
+        runtime["base_url"] = _RUNTIME_MAIN_BASE_URL.strip()
+    if isinstance(_RUNTIME_MAIN_API_KEY, str) and _RUNTIME_MAIN_API_KEY.strip():
+        runtime["api_key"] = _RUNTIME_MAIN_API_KEY.strip()
+    if isinstance(_RUNTIME_MAIN_API_MODE, str) and _RUNTIME_MAIN_API_MODE.strip():
+        runtime["api_mode"] = _RUNTIME_MAIN_API_MODE.strip().lower()
+    return runtime
+
+
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Resolve the active custom/main endpoint the same way the main CLI does.
 
@@ -3339,6 +3355,8 @@ def _resolve_auto(
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     runtime = _normalize_main_runtime(main_runtime)
+    if not runtime:
+        runtime = _normalize_main_runtime(_read_runtime_main())
     runtime_provider = runtime.get("provider", "")
     runtime_model = str(runtime.get("model") or "")
     runtime_base_url = str(runtime.get("base_url") or "")

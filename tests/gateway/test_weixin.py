@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -501,6 +502,48 @@ class TestWeixinChunkDelivery:
         # Once the first send observes iLink's rate limit, the breaker opens;
         # queued concurrent sends acquire the gate later and fail before making
         # their own iLink calls.
+        assert send_message_mock.await_count == 1
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_rate_limit_sets_chat_cooldown(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 1
+        adapter._send_chunk_retry_delay_seconds = 2.0
+        send_message_mock.side_effect = [
+            {"ret": -2, "errmsg": "rate limited"},
+            {"ret": 0},
+        ]
+
+        asyncio.run(
+            adapter._send_text_chunk(
+                chat_id="wxid_test123",
+                chunk="hello",
+                context_token="ctx-token",
+                client_id="msg-1",
+            )
+        )
+
+        assert "wxid_test123" not in adapter._send_rate_limited_until
+        assert sleep_mock.await_count >= 1
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_existing_chat_cooldown_waits_before_send(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        adapter._send_rate_limited_until["wxid_test123"] = time.monotonic() + 5.0
+        send_message_mock.return_value = {"ret": 0}
+
+        asyncio.run(
+            adapter._send_text_chunk(
+                chat_id="wxid_test123",
+                chunk="hello",
+                context_token="ctx-token",
+                client_id="msg-2",
+            )
+        )
+
+        assert sleep_mock.await_count >= 1
         assert send_message_mock.await_count == 1
 
 

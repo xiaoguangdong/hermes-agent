@@ -1153,6 +1153,40 @@ def test_resolve_requested_provider_precedence(monkeypatch):
     assert rp.resolve_requested_provider() == "auto"
 
 
+def test_resolve_requested_provider_accepts_named_provider_from_providers_dict(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "OpenAI",
+            "default": "gpt-5.5",
+            "base_url": "https://relay.example.com/v1",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "OpenAI",
+                "default": "gpt-5.5",
+                "base_url": "https://relay.example.com/v1",
+            },
+            "providers": {
+                "OpenAI": {
+                    "name": "OpenAI",
+                    "base_url": "https://relay.example.com/v1",
+                    "key_env": "OPENAI_API_KEY",
+                    "transport": "codex_responses",
+                    "default_model": "gpt-5.5",
+                }
+            },
+        },
+    )
+
+    assert rp.resolve_requested_provider() == "openai"
+
+
 # ── api_mode config override tests ──────────────────────────────────────
 
 

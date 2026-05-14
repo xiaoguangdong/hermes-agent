@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import copy
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -1723,6 +1724,132 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
+def _codex_home() -> Path:
+    raw = os.getenv("CODEX_HOME", "").strip()
+    return Path(raw).expanduser() if raw else (Path.home() / ".codex")
+
+
+def _snapshot_file_signature(path: Path) -> tuple[Optional[int], Optional[int]]:
+    try:
+        stat = path.stat()
+        return int(stat.st_mtime_ns), int(stat.st_size)
+    except FileNotFoundError:
+        return None, None
+    except Exception:
+        return None, None
+
+
+def _read_codex_runtime_config() -> dict[str, Any]:
+    codex_home = _codex_home()
+    config_path = codex_home / "config.toml"
+    if not config_path.is_file():
+        return {}
+    try:
+        import tomllib
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("Failed to read Codex config %s: %s", config_path, exc)
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    provider_name = str(payload.get("model_provider") or "").strip()
+    model_name = str(payload.get("model") or "").strip()
+    context_window = payload.get("model_context_window")
+    providers = payload.get("model_providers")
+    provider_entry = providers.get(provider_name) if isinstance(providers, dict) and provider_name else None
+    if not isinstance(provider_entry, dict):
+        provider_entry = {}
+
+    wire_api = str(provider_entry.get("wire_api") or "").strip().lower()
+    api_mode = ""
+    if wire_api == "responses":
+        api_mode = "codex_responses"
+    elif wire_api in {"chat", "chat_completions", "openai_chat"}:
+        api_mode = "chat_completions"
+    elif wire_api == "anthropic_messages":
+        api_mode = "anthropic_messages"
+
+    result: dict[str, Any] = {
+        "provider_name": provider_name,
+        "model": model_name,
+        "base_url": str(provider_entry.get("base_url") or "").strip(),
+        "api_mode": api_mode,
+        "context_length": context_window if isinstance(context_window, int) and context_window > 0 else None,
+    }
+    if provider_entry:
+        result["provider_entry"] = {
+            "name": str(provider_entry.get("name") or provider_name or "").strip() or provider_name,
+            "base_url": str(provider_entry.get("base_url") or "").strip(),
+            "key_env": "OPENAI_API_KEY" if provider_entry.get("requires_openai_auth") else "",
+            "transport": api_mode or "chat_completions",
+            "default_model": model_name,
+        }
+    return result
+
+
+def _sync_hermes_config_from_codex(*, config_home: Optional[Path] = None) -> bool:
+    """Mirror primary model/provider settings from ~/.codex/config.toml into ~/.hermes/config.yaml.
+
+    Returns True when config.yaml changed.
+    """
+    codex_cfg = _read_codex_runtime_config()
+    provider_name = str(codex_cfg.get("provider_name") or "").strip()
+    model_name = str(codex_cfg.get("model") or "").strip()
+    base_url = str(codex_cfg.get("base_url") or "").strip()
+    api_mode = str(codex_cfg.get("api_mode") or "").strip()
+    if not provider_name or not model_name or not base_url:
+        return False
+
+    cfg_home = config_home or _hermes_home
+    config_path = cfg_home / "config.yaml"
+    current = _load_gateway_config() if cfg_home == _hermes_home else {}
+    if not current and config_path.exists():
+        try:
+            import yaml
+            with open(config_path, "r", encoding="utf-8") as handle:
+                current = yaml.safe_load(handle) or {}
+        except Exception:
+            current = {}
+
+    updated = copy.deepcopy(current) if isinstance(current, dict) else {}
+    model_cfg = dict(updated.get("model") or {}) if isinstance(updated.get("model"), dict) else {}
+    providers_cfg = dict(updated.get("providers") or {}) if isinstance(updated.get("providers"), dict) else {}
+
+    model_cfg["provider"] = provider_name
+    model_cfg["default"] = model_name
+    model_cfg["base_url"] = base_url
+    if api_mode:
+        model_cfg["api_mode"] = api_mode
+    context_length = codex_cfg.get("context_length")
+    if isinstance(context_length, int) and context_length > 0:
+        model_cfg["context_length"] = context_length
+
+    provider_entry = codex_cfg.get("provider_entry") or {}
+    if isinstance(provider_entry, dict) and provider_name:
+        existing_entry = dict(providers_cfg.get(provider_name) or {}) if isinstance(providers_cfg.get(provider_name), dict) else {}
+        existing_entry.update({
+            "name": provider_entry.get("name") or provider_name,
+            "base_url": provider_entry.get("base_url") or base_url,
+            "transport": provider_entry.get("transport") or api_mode or "chat_completions",
+            "default_model": provider_entry.get("default_model") or model_name,
+        })
+        key_env = str(provider_entry.get("key_env") or "").strip()
+        if key_env:
+            existing_entry["key_env"] = key_env
+        providers_cfg[provider_name] = existing_entry
+
+    updated["model"] = model_cfg
+    updated["providers"] = providers_cfg
+
+    if updated == current:
+        return False
+
+    atomic_yaml_write(config_path, updated, sort_keys=False)
+    return True
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -2500,6 +2627,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
+        try:
+            _sync_hermes_config_from_codex()
+        except Exception as exc:
+            logger.debug("Codex->Hermes config sync skipped during init: %s", exc)
         self.config = config or load_gateway_config()
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
@@ -5918,6 +6049,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         asyncio.create_task(self._platform_reconnect_watcher())
 
+        # Keep Hermes primary model/runtime aligned with Codex CLI config/auth.
+        asyncio.create_task(self._codex_runtime_sync_watcher())
+
         # Start background handoff watcher — picks up CLI sessions marked
         # handoff_state='pending' in state.db and re-binds them to the
         # destination platform's home channel, then forges a synthetic user
@@ -5933,6 +6067,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    async def _codex_runtime_sync_watcher(self, interval: float = 2.0) -> None:
+        """Watch ~/.codex/config.toml and ~/.codex/auth.json, sync config, then restart."""
+        codex_home = _codex_home()
+        watched_paths = (
+            codex_home / "config.toml",
+            codex_home / "auth.json",
+        )
+        signatures = {path: _snapshot_file_signature(path) for path in watched_paths}
+
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval)
+                changed: list[Path] = []
+                for path in watched_paths:
+                    current_sig = _snapshot_file_signature(path)
+                    if current_sig != signatures[path]:
+                        signatures[path] = current_sig
+                        changed.append(path)
+                if not changed:
+                    continue
+
+                changed_names = ", ".join(path.name for path in changed)
+                synced = _sync_hermes_config_from_codex()
+                if synced:
+                    logger.info(
+                        "Codex runtime changed (%s); synced ~/.hermes/config.yaml and requesting gateway restart.",
+                        changed_names,
+                    )
+                else:
+                    logger.info(
+                        "Codex runtime changed (%s); requesting gateway restart to resync auth/runtime.",
+                        changed_names,
+                    )
+                self.request_restart(detached=False, via_service=True)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Codex runtime sync watcher error: %s", exc, exc_info=True)
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.

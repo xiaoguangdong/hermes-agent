@@ -1822,8 +1822,25 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
     )
+
+    def _set_cron_delivery_var(name: str, value: str) -> None:
+        var = _VAR_MAP.get(name)
+        if var is not None:
+            var.set(value)
+        else:
+            # Back-compat / hot-reload tolerance: older partially initialized
+            # session_context modules may not expose the cron ContextVars yet.
+            # get_session_env() falls back to os.environ in that case.
+            os.environ[name] = value
+
+    def _clear_cron_delivery_var(name: str) -> None:
+        var = _VAR_MAP.get(name)
+        if var is not None:
+            var.set("")
+        os.environ.pop(name, None)
+
     for _var_name in _cron_delivery_vars:
-        _VAR_MAP[_var_name].set("")
+        _clear_cron_delivery_var(_var_name)
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
@@ -1860,9 +1877,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
+            _set_cron_delivery_var("HERMES_CRON_AUTO_DELIVER_PLATFORM", delivery_target["platform"])
+            _set_cron_delivery_var("HERMES_CRON_AUTO_DELIVER_CHAT_ID", str(delivery_target["chat_id"]))
+            _set_cron_delivery_var(
+                "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
                 ""
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
@@ -2263,7 +2281,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
-            _VAR_MAP[_var_name].set("")
+            _clear_cron_delivery_var(_var_name)
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected
