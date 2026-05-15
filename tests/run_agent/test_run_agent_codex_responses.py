@@ -706,6 +706,8 @@ def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
     """Regression: empty response.output + valid output_text should succeed,
     not trigger retry/fallback. The validation stage must defer to
     _normalize_codex_response which synthesizes output from output_text."""
+    import hermes_logging
+    monkeypatch.setattr(hermes_logging, "setup_logging", lambda *args, **kwargs: None)
     agent = _build_agent(monkeypatch)
 
     def _empty_output_response(api_kwargs):
@@ -723,6 +725,33 @@ def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
 
     assert result["completed"] is True
     assert result["final_response"] == "Hello from Codex"
+
+
+def test_run_conversation_codex_stream_empty_choices_returns_error_not_indexerror(monkeypatch):
+    """Regression: codex/Responses paths that normalize into empty choices
+    must fail gracefully and trigger the invalid-response handling path
+    rather than exploding on choices[0]."""
+    import hermes_logging
+    monkeypatch.setattr(hermes_logging, "setup_logging", lambda *args, **kwargs: None)
+    agent = _build_agent(monkeypatch)
+
+    def _empty_choices_response(api_kwargs):
+        return SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(input_tokens=5, output_tokens=0, total_tokens=5),
+            status="completed",
+            model="gpt-5.4",
+        )
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda *args, **kwargs: _empty_choices_response(None))
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", lambda *args, **kwargs: _empty_choices_response(None))
+
+    result = agent.run_conversation("Say hello")
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert "error" in result
+    assert "Invalid API response" in result["error"]
 
 
 def test_run_conversation_codex_empty_output_no_output_text_retries(monkeypatch):

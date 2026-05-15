@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
@@ -50,6 +52,38 @@ def _getenv(name: str, default: str = "") -> str:
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
+
+
+def _read_codex_auth_json_key(key_name: str) -> str:
+    """Best-effort read of a shared key from ~/.codex/auth.json."""
+    try:
+        auth_path = Path.home() / ".codex" / "auth.json"
+        if not auth_path.exists():
+            return ""
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        value = payload.get(key_name)
+        return str(value or "").strip() if isinstance(value, str) else ""
+    except Exception:
+        return ""
+
+
+def _resolve_key_env_value(key_env: str, *, prefer_codex_auth: bool = False) -> str:
+    """Resolve provider key_env values with optional ~/.codex/auth.json fallback.
+
+    For Codex-sourced OpenAI-compatible providers we want the same token source
+    as the local Codex CLI, not a stale ~/.hermes/.env override.
+    """
+    env_name = str(key_env or "").strip()
+    if not env_name:
+        return ""
+    env_value = _getenv(env_name, "").strip()
+    if env_name != "OPENAI_API_KEY":
+        return env_value
+
+    codex_value = _read_codex_auth_json_key("OPENAI_API_KEY")
+    if prefer_codex_auth and codex_value:
+        return codex_value
+    return env_value or codex_value
 
 
 def _loopback_hostname(host: str) -> bool:
@@ -438,7 +472,14 @@ def _resolve_runtime_from_pool_entry(
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
     """Resolve provider request from explicit arg, config, then env."""
     if requested and requested.strip():
-        return requested.strip().lower()
+        requested_norm = requested.strip().lower()
+        if requested_norm == "main":
+            model_cfg = _get_model_config()
+            cfg_provider = model_cfg.get("provider")
+            if isinstance(cfg_provider, str) and cfg_provider.strip():
+                return cfg_provider.strip().lower()
+            return "auto"
+        return requested_norm
 
     model_cfg = _get_model_config()
     cfg_provider = model_cfg.get("provider")
@@ -552,7 +593,17 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             name_norm = _normalize_custom_provider_name(ep_name)
             # Resolve the API key from the env var name stored in key_env
             key_env = str(entry.get("key_env", "") or "").strip()
-            resolved_api_key = _getenv(key_env, "").strip() if key_env else ""
+            prefer_codex_auth = (
+                str(entry.get("auth_source", "") or "").strip() == "codex_auth_json"
+                or (
+                    key_env == "OPENAI_API_KEY"
+                    and _parse_api_mode(entry.get("api_mode") or entry.get("transport")) == "codex_responses"
+                )
+            )
+            resolved_api_key = _resolve_key_env_value(
+                key_env,
+                prefer_codex_auth=prefer_codex_auth,
+            )
             # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
                 resolved_api_key = str(entry.get("api_key", "") or "").strip()
@@ -570,6 +621,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)
+                    if prefer_codex_auth:
+                        result["auth_source"] = "codex_auth_json"
                     # The v11→v12 migration writes the API mode under the new
                     # ``transport`` field, but hand-edited configs may still
                     # use the legacy ``api_mode`` spelling.  Accept both —
@@ -599,6 +652,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         extra_body = entry.get("extra_body")
                         if isinstance(extra_body, dict):
                             result["extra_body"] = dict(extra_body)
+                        if prefer_codex_auth:
+                            result["auth_source"] = "codex_auth_json"
                         api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                         if api_mode:
                             result["api_mode"] = api_mode

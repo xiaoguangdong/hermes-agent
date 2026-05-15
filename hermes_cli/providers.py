@@ -703,8 +703,9 @@ def resolve_provider_full(
     Returns:
         ProviderDef if found, else None.
     """
-    canonical = normalize_provider(name)
-    raw = name.strip().lower()
+    raw_name = (name or "").strip()
+    raw = raw_name.lower()
+    canonical = normalize_provider(raw_name)
 
     # 0. User-defined config providers win over the built-in alias table.
     #    A user who declares ``providers.<name>`` in config.yaml has stated
@@ -715,30 +716,35 @@ def resolve_provider_full(
     #    silently route to OpenRouter. Only the raw (pre-alias) name is tried
     #    here; canonical/alias resolution still happens below.
     if user_providers:
-        user_pdef = resolve_user_provider(raw, user_providers)
+        for candidate in (raw_name, raw, canonical):
+            if not candidate:
+                continue
+            user_pdef = resolve_user_provider(candidate, user_providers)
+            if user_pdef is not None:
+                return user_pdef
+
+    # 1. User-defined providers from config
+    if user_providers:
+        # Prefer exact/raw-name matches first so a user-defined provider like
+        # `OpenAI` does not get hijacked by the built-in `openai` → openrouter
+        # alias before we inspect the config entry.
+        user_pdef = resolve_user_provider(raw_name, user_providers)
         if user_pdef is not None:
             return user_pdef
-
-    # 1. Built-in (models.dev + overlays)
-    pdef = get_provider(canonical)
-    if pdef is not None:
-        return pdef
-
-    # 2. User-defined providers from config
-    if user_providers:
         # Try canonical name
         user_pdef = resolve_user_provider(canonical, user_providers)
         if user_pdef is not None:
             return user_pdef
-        # Try original name (in case alias didn't match)
-        user_pdef = resolve_user_provider(raw, user_providers)
-        if user_pdef is not None:
-            return user_pdef
 
     # 2b. Saved custom providers from config
-    custom_pdef = resolve_custom_provider(name, custom_providers)
+    custom_pdef = resolve_custom_provider(raw_name, custom_providers)
     if custom_pdef is not None:
         return custom_pdef
+
+    # 2c. Built-in (models.dev + overlays)
+    pdef = get_provider(canonical)
+    if pdef is not None:
+        return pdef
 
     # 3. Try models.dev directly (for providers not in our ALIASES)
     try:

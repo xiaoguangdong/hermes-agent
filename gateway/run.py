@@ -1783,6 +1783,7 @@ def _read_codex_runtime_config() -> dict[str, Any]:
             "name": str(provider_entry.get("name") or provider_name or "").strip() or provider_name,
             "base_url": str(provider_entry.get("base_url") or "").strip(),
             "key_env": "OPENAI_API_KEY" if provider_entry.get("requires_openai_auth") else "",
+            "auth_source": "codex_auth_json" if provider_entry.get("requires_openai_auth") else "",
             "transport": api_mode or "chat_completions",
             "default_model": model_name,
         }
@@ -1838,6 +1839,9 @@ def _sync_hermes_config_from_codex(*, config_home: Optional[Path] = None) -> boo
         key_env = str(provider_entry.get("key_env") or "").strip()
         if key_env:
             existing_entry["key_env"] = key_env
+        auth_source = str(provider_entry.get("auth_source") or "").strip()
+        if auth_source:
+            existing_entry["auth_source"] = auth_source
         providers_cfg[provider_name] = existing_entry
 
     updated["model"] = model_cfg

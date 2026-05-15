@@ -886,6 +886,7 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("GPT_KEY", "gpt-secret")
     monkeypatch.setenv("CLAUDE_KEY", "claude-secret")
+
     monkeypatch.setattr(
         rp,
         "load_config",
@@ -926,6 +927,43 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
     assert resolved["api_mode"] == "anthropic_messages"
     assert resolved["requested_provider"] == "custom:claude"
     assert resolved["model"] == "claude-opus-4-8"
+
+
+def test_named_custom_provider_prefers_codex_auth_json_for_synced_openai_provider(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-hermes-env-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(rp, "_read_codex_auth_json_key", lambda key: "fresh-codex-auth-key")
+
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "OpenAI": {
+                    "base_url": "https://www.tokenrouter.tech/v1",
+                    "default_model": "gpt-5.4",
+                    "key_env": "OPENAI_API_KEY",
+                    "auth_source": "codex_auth_json",
+                    "name": "OpenAI",
+                    "transport": "codex_responses",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("resolve_provider should not be called for named custom providers")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="OpenAI")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["base_url"] == "https://www.tokenrouter.tech/v1"
+    assert resolved["api_key"] == "fresh-codex-auth-key"
+    assert resolved["source"] == "custom_provider:OpenAI"
 
 
 def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
@@ -1185,6 +1223,46 @@ def test_resolve_requested_provider_accepts_named_provider_from_providers_dict(m
     )
 
     assert rp.resolve_requested_provider() == "openai"
+
+
+def test_resolve_runtime_provider_accepts_main_alias_for_named_custom_provider(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "OpenAI",
+            "default": "gpt-5.5",
+            "base_url": "https://relay.example.com/v1",
+            "api_mode": "codex_responses",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "OpenAI",
+                "default": "gpt-5.5",
+                "base_url": "https://relay.example.com/v1",
+                "api_mode": "codex_responses",
+            },
+            "providers": {
+                "OpenAI": {
+                    "name": "OpenAI",
+                    "base_url": "https://relay.example.com/v1",
+                    "key_env": "OPENAI_API_KEY",
+                    "transport": "codex_responses",
+                    "default_model": "gpt-5.5",
+                }
+            },
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="main")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["base_url"] == "https://relay.example.com/v1"
+    assert resolved["api_mode"] == "codex_responses"
 
 
 # ── api_mode config override tests ──────────────────────────────────────
