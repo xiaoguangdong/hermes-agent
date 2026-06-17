@@ -99,7 +99,7 @@ def _make_runner(gateway_run):
     return runner
 
 
-def test_codex_runtime_sync_watcher_restarts_on_config_change(tmp_path, monkeypatch):
+def test_codex_runtime_sync_watcher_ignores_config_change(tmp_path, monkeypatch):
     gateway_run = importlib.import_module("gateway.run")
     hermes_home = tmp_path / ".hermes"
     codex_home = tmp_path / ".codex"
@@ -115,7 +115,7 @@ def test_codex_runtime_sync_watcher_restarts_on_config_change(tmp_path, monkeypa
         await asyncio.sleep(0.03)
         _write_codex_config(codex_home, base_url="https://api.new.example/v1")
         await asyncio.sleep(0.08)
-        assert runner.request_restart.called
+        assert not runner.request_restart.called
         runner._shutdown_event.set()
         if not watcher.done():
             watcher.cancel()

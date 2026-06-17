@@ -6073,10 +6073,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return True
 
     async def _codex_runtime_sync_watcher(self, interval: float = 2.0) -> None:
-        """Watch ~/.codex/config.toml and ~/.codex/auth.json, sync config, then restart."""
+        """Watch ~/.codex/auth.json, then restart to pick up refreshed Codex auth.
+
+        We intentionally do *not* hot-restart on ~/.codex/config.toml changes.
+        Model/version/reasoning tweaks in the Codex CLI config should not bounce
+        the gateway out from under active chats. The gateway still mirrors
+        ~/.codex/config.toml into ~/.hermes/config.yaml during startup via
+        ``_sync_hermes_config_from_codex()``, so config changes take effect on
+        the next explicit restart without live-process churn.
+        """
         codex_home = _codex_home()
         watched_paths = (
-            codex_home / "config.toml",
             codex_home / "auth.json",
         )
         signatures = {path: _snapshot_file_signature(path) for path in watched_paths}
