@@ -510,6 +510,7 @@ class TestWeixinChunkDelivery:
         adapter = self._connected_adapter()
         adapter._send_chunk_retries = 1
         adapter._send_chunk_retry_delay_seconds = 2.0
+        adapter._rate_limit_circuit_open_seconds = 0.0
         send_message_mock.side_effect = [
             {"ret": -2, "errmsg": "rate limited"},
             {"ret": 0},

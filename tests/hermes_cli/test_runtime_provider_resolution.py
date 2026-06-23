@@ -932,8 +932,16 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
 def test_named_custom_provider_prefers_codex_auth_json_for_synced_openai_provider(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "stale-hermes-env-key")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.setattr(rp, "_read_codex_auth_json_key", lambda key: "fresh-codex-auth-key")
-
+    monkeypatch.setattr(
+        rp,
+        "_read_codex_auth_state",
+        lambda: {
+            "mode": "api_key",
+            "api_key": "fresh-codex-auth-key",
+            "auth_file": "/tmp/codex/auth.json",
+        },
+    )
+    monkeypatch.setattr(rp, "_read_codex_config_state", lambda: {"model": "gpt-5.4"})
     monkeypatch.setattr(
         rp,
         "load_config",
@@ -964,6 +972,84 @@ def test_named_custom_provider_prefers_codex_auth_json_for_synced_openai_provide
     assert resolved["base_url"] == "https://www.tokenrouter.tech/v1"
     assert resolved["api_key"] == "fresh-codex-auth-key"
     assert resolved["source"] == "custom_provider:OpenAI"
+    assert resolved["auth_source_resolved"] == "codex_api_key"
+
+
+def test_named_custom_provider_uses_codex_oauth_when_codex_auth_is_chatgpt(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-hermes-env-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "_read_codex_auth_state",
+        lambda: {
+            "mode": "oauth",
+            "access_token": "codex-oauth-access-token",
+            "refresh_token": "codex-oauth-refresh-token",
+            "auth_file": "/tmp/codex/auth.json",
+            "last_refresh": "2026-06-23T00:00:00Z",
+        },
+    )
+    monkeypatch.setattr(rp, "_read_codex_config_state", lambda: {"model": "gpt-5.5"})
+    monkeypatch.setattr(rp, "_jwt_token_is_expiring_soon", lambda token, skew_seconds=300: False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "OpenAI": {
+                    "base_url": "https://www.tokenrouter.tech/v1",
+                    "default_model": "gpt-5.5",
+                    "key_env": "OPENAI_API_KEY",
+                    "auth_source": "codex_auth_json",
+                    "name": "OpenAI",
+                    "transport": "codex_responses",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("resolve_provider should not be called for named custom providers")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="OpenAI")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == rp.DEFAULT_CODEX_BASE_URL
+    assert resolved["api_key"] == "codex-oauth-access-token"
+    assert resolved["source"] == "codex-cli-auth-json"
+    assert resolved["auth_source_resolved"] == "codex_oauth"
+
+
+def test_codex_auth_json_oauth_expired_refresh_failure_returns_none(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "_read_codex_auth_state",
+        lambda: {
+            "mode": "oauth",
+            "access_token": "expired-codex-oauth-access-token",
+            "refresh_token": "codex-oauth-refresh-token",
+            "auth_file": "/tmp/codex/auth.json",
+        },
+    )
+    monkeypatch.setattr(rp, "_read_codex_config_state", lambda: {})
+    monkeypatch.setattr(rp, "_jwt_token_is_expiring_soon", lambda token, skew_seconds=300: True)
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("refresh failed")),
+    )
+
+    resolved = rp._resolve_codex_auth_json_runtime(
+        custom_provider={"name": "OpenAI", "api_mode": "codex_responses"},
+        base_url="https://www.tokenrouter.tech/v1",
+        requested_provider="OpenAI",
+    )
+
+    assert resolved is None
 
 
 def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
+import time
+import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
@@ -35,6 +38,7 @@ from hermes_cli.auth import (
 from hermes_cli.config import get_compatible_custom_providers, load_config
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
+from utils import atomic_json_write
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -50,6 +54,14 @@ def _getenv(name: str, default: str = "") -> str:
     return val if val is not None else default
 
 
+def _codex_cli_home() -> Path:
+    """Return the Codex CLI home directory, honoring CODEX_HOME."""
+    codex_home = os.getenv("CODEX_HOME", "").strip()
+    if codex_home:
+        return Path(codex_home).expanduser()
+    return Path.home() / ".codex"
+
+
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
 
@@ -57,7 +69,7 @@ def _normalize_custom_provider_name(value: str) -> str:
 def _read_codex_auth_json_key(key_name: str) -> str:
     """Best-effort read of a shared key from ~/.codex/auth.json."""
     try:
-        auth_path = Path.home() / ".codex" / "auth.json"
+        auth_path = _codex_cli_home() / "auth.json"
         if not auth_path.exists():
             return ""
         payload = json.loads(auth_path.read_text(encoding="utf-8"))
@@ -65,6 +77,25 @@ def _read_codex_auth_json_key(key_name: str) -> str:
         return str(value or "").strip() if isinstance(value, str) else ""
     except Exception:
         return ""
+
+
+def _jwt_token_is_expiring_soon(token: str, skew_seconds: int = 300) -> bool:
+    """Check if a JWT access token expires within skew_seconds.
+
+    Returns True if the token is unparseable (treat as likely expiring).
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return True
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded))
+        exp = decoded.get("exp")
+        if not isinstance(exp, (int, float)):
+            return True
+        return time.time() >= exp - skew_seconds
+    except Exception:
+        return True
 
 
 def _resolve_key_env_value(key_env: str, *, prefer_codex_auth: bool = False) -> str:
@@ -564,6 +595,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
     # is exempt from the shadow check — it is not a built-in to defer to.
     if requested_norm == "auto":
         return None
+    config = load_config()
     if requested_norm != "custom" and not requested_norm.startswith("custom:"):
         try:
             canonical = auth_mod.resolve_provider(requested_norm)
@@ -579,10 +611,32 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             # the built-in. See tests/hermes_cli/test_runtime_provider_resolution.py
             # ``test_named_custom_provider_does_not_shadow_builtin_provider``.
             if (canonical or "").strip().lower() == requested_norm:
-                return None
+                providers = config.get("providers")
+                has_explicit_provider_match = False
+                if isinstance(providers, dict):
+                    for ep_name, entry in providers.items():
+                        if not isinstance(entry, dict):
+                            continue
+                        name_norm = _normalize_custom_provider_name(str(ep_name))
+                        display_name = entry.get("name", "")
+                        display_norm = (
+                            _normalize_custom_provider_name(display_name)
+                            if isinstance(display_name, str) and display_name
+                            else ""
+                        )
+                        if requested_norm in {
+                            str(ep_name),
+                            name_norm,
+                            f"custom:{name_norm}",
+                            display_name,
+                            display_norm,
+                            f"custom:{display_norm}" if display_norm else "",
+                        }:
+                            has_explicit_provider_match = True
+                            break
+                if not has_explicit_provider_match:
+                    return None
 
-    config = load_config()
-    
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -593,13 +647,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             name_norm = _normalize_custom_provider_name(ep_name)
             # Resolve the API key from the env var name stored in key_env
             key_env = str(entry.get("key_env", "") or "").strip()
-            prefer_codex_auth = (
-                str(entry.get("auth_source", "") or "").strip() == "codex_auth_json"
-                or (
-                    key_env == "OPENAI_API_KEY"
-                    and _parse_api_mode(entry.get("api_mode") or entry.get("transport")) == "codex_responses"
-                )
-            )
+            prefer_codex_auth = str(entry.get("auth_source", "") or "").strip() == "codex_auth_json"
             resolved_api_key = _resolve_key_env_value(
                 key_env,
                 prefer_codex_auth=prefer_codex_auth,
@@ -852,6 +900,197 @@ def _custom_provider_request_overrides(custom_provider: Dict[str, Any]) -> Dict[
     return {"extra_body": dict(extra_body)}
 
 
+def _read_codex_config_state() -> Dict[str, Any]:
+    """Read non-secret routing hints from CODEX_HOME/config.toml."""
+    config_path = _codex_cli_home() / "config.toml"
+    if not config_path.exists():
+        return {}
+    try:
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    state: Dict[str, Any] = {}
+    model = payload.get("model")
+    if isinstance(model, str) and model.strip():
+        state["model"] = model.strip()
+    model_provider = payload.get("model_provider")
+    if isinstance(model_provider, str) and model_provider.strip():
+        state["model_provider"] = model_provider.strip()
+
+    provider_cfg: Dict[str, Any] = {}
+    providers = payload.get("model_providers")
+    if isinstance(providers, dict):
+        provider_name = str(state.get("model_provider") or "").strip()
+        raw_provider_cfg = providers.get(provider_name) if provider_name else None
+        if isinstance(raw_provider_cfg, dict):
+            provider_cfg = raw_provider_cfg
+    if provider_cfg:
+        base_url = provider_cfg.get("base_url")
+        if isinstance(base_url, str) and base_url.strip():
+            state["base_url"] = base_url.strip().rstrip("/")
+        wire_api = provider_cfg.get("wire_api")
+        if isinstance(wire_api, str) and wire_api.strip():
+            state["wire_api"] = wire_api.strip()
+    return state
+
+
+def _read_codex_auth_state() -> Dict[str, Any]:
+    """Read CODEX_HOME/auth.json and return parsed auth state.
+
+    Returns dict with at minimum {"mode": "none"} if the file is absent/unreadable.
+    Possible modes: "oauth", "api_key", "none".
+    """
+    try:
+        auth_path = _codex_cli_home() / "auth.json"
+        if not auth_path.exists():
+            return {"mode": "none"}
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+
+        auth_mode = str(payload.get("auth_mode", "") or "").strip()
+        tokens = payload.get("tokens")
+        static_key = str(payload.get("OPENAI_API_KEY", "") or "").strip()
+
+        # OAuth mode: auth_mode == "chatgpt" with valid tokens.access_token
+        if auth_mode == "chatgpt" and isinstance(tokens, dict):
+            access_token = str(tokens.get("access_token", "") or "").strip()
+            refresh_token = str(tokens.get("refresh_token", "") or "").strip()
+            account_id = str(tokens.get("account_id", "") or "").strip()
+            if access_token or refresh_token:
+                return {
+                    "mode": "oauth",
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "account_id": account_id,
+                    "last_refresh": payload.get("last_refresh", ""),
+                    "auth_file": str(auth_path),
+                }
+
+        # API key mode: OPENAI_API_KEY field set
+        if static_key:
+            return {
+                "mode": "api_key",
+                "api_key": static_key,
+                "auth_file": str(auth_path),
+            }
+
+        return {"mode": "none"}
+    except Exception:
+        return {"mode": "none"}
+
+
+def _resolve_codex_auth_json_runtime(
+    *,
+    custom_provider: Dict[str, Any],
+    base_url: str,
+    requested_provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve runtime from ~/.codex/auth.json by inspecting real auth state.
+
+    Three possible outcomes:
+    1. OAuth mode (auth_mode=chatgpt, has tokens.access_token)
+       → switch to the Codex backend, using the existing openai-codex transport
+    2. API key mode (OPENAI_API_KEY field present)
+       → keep the configured base_url (third-party proxy), use that key
+    3. Neither available
+       → return None, caller falls through to deepseek
+
+    In OAuth mode the access_token is auto-refreshed via refresh_token
+    when close to expiry, and the updated tokens are persisted back to
+    ~/.codex/auth.json so Codex CLI stays in sync.
+    """
+    codex_state = _read_codex_auth_state()
+    codex_config = _read_codex_config_state()
+    mode = codex_state.get("mode", "none")
+    model_hint = (
+        str(custom_provider.get("model") or "").strip()
+        or str(codex_config.get("model") or "").strip()
+    )
+
+    # --- Case 2: API key mode (third-party proxy) ---
+    if mode == "api_key":
+        api_key = codex_state.get("api_key", "")
+        cfg_base_url = str(codex_config.get("base_url") or "").strip().rstrip("/")
+        resolved_base_url = base_url or cfg_base_url
+        api_mode = (
+            custom_provider.get("api_mode")
+            or _detect_api_mode_for_url(resolved_base_url)
+            or "chat_completions"
+        )
+        result = {
+            "provider": "custom",
+            "api_mode": api_mode,
+            "base_url": resolved_base_url,
+            "api_key": api_key,
+            "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
+            "auth_source_resolved": "codex_api_key",
+            "auth_file": codex_state.get("auth_file"),
+        }
+        if model_hint:
+            result["model"] = model_hint
+        return result
+
+    # --- Case 1: OAuth mode (ChatGPT Codex backend) ---
+    if mode == "oauth":
+        access_token = str(codex_state.get("access_token", "") or "").strip()
+        refresh_token = str(codex_state.get("refresh_token", "") or "").strip()
+
+        # Auto-refresh if token is missing or expiring
+        if refresh_token and (not access_token or _jwt_token_is_expiring_soon(access_token)):
+            try:
+                from hermes_cli.auth import refresh_codex_oauth_pure
+
+                refreshed = refresh_codex_oauth_pure(access_token, refresh_token, timeout_seconds=20.0)
+                new_token = str(refreshed.get("access_token", "") or "").strip()
+                if new_token:
+                    # Persist back to CODEX_HOME/auth.json so Codex CLI stays in sync.
+                    _persist_codex_oauth_tokens(
+                        new_token,
+                        str(refreshed.get("refresh_token", refresh_token) or refresh_token),
+                    )
+                    access_token = new_token
+            except Exception:
+                logger.debug("Codex OAuth token refresh failed, using existing token if valid")
+                if not access_token or _jwt_token_is_expiring_soon(access_token, 0):
+                    return None  # No usable token
+
+        if access_token:
+            result = {
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": DEFAULT_CODEX_BASE_URL,
+                "api_key": access_token,
+                "source": "codex-cli-auth-json",
+                "auth_source_resolved": "codex_oauth",
+                "auth_file": codex_state.get("auth_file"),
+                "last_refresh": codex_state.get("last_refresh"),
+            }
+            if model_hint:
+                result["model"] = model_hint
+            return result
+
+        return None  # OAuth state but no usable token
+
+    # --- Case 3: No Codex auth at all ---
+    return None
+
+
+def _persist_codex_oauth_tokens(access_token: str, refresh_token: str) -> None:
+    """Write updated OAuth tokens back to CODEX_HOME/auth.json."""
+    try:
+        auth_path = _codex_cli_home() / "auth.json"
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        payload.setdefault("tokens", {})
+        payload["tokens"]["access_token"] = access_token
+        payload["tokens"]["refresh_token"] = refresh_token
+        payload["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        atomic_json_write(auth_path, payload, indent=4)
+    except Exception:
+        pass
+
+
 def _resolve_named_custom_runtime(
     *,
     requested_provider: str,
@@ -918,6 +1157,23 @@ def _resolve_named_custom_runtime(
         or custom_provider.get("base_url", "")
     ).rstrip("/")
     if not base_url:
+        return None
+
+    # =========================================================================
+    # auth_source: codex_auth_json — read Codex's auth state and decide mode
+    # =========================================================================
+    auth_source = str(custom_provider.get("auth_source", "") or "").strip()
+    if auth_source == "codex_auth_json":
+        codex_runtime = _resolve_codex_auth_json_runtime(
+            custom_provider=custom_provider,
+            base_url=base_url,
+            requested_provider=requested_provider,
+        )
+        if codex_runtime:
+            return codex_runtime
+        # If Codex auth is unusable, fall through to deepseek or whatever
+        # fallback mechanism the caller has. Return None to signal "no valid
+        # credentials for this provider", and the caller will try env/pool.
         return None
 
     # Check if a credential pool exists for this custom endpoint
